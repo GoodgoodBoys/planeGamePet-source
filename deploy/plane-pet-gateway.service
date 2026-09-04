@@ -1,0 +1,35 @@
+[Unit]
+Description=Plane Pet authenticated WebSocket gateway
+After=network-online.target plane-pet.service
+Wants=network-online.target
+Requires=plane-pet.service
+
+[Service]
+Type=simple
+User=plane-pet
+Group=plane-pet
+Environment=PLANE_PET_GATEWAY_HOST=127.0.0.1
+Environment=PLANE_PET_GATEWAY_PORT=32111
+Environment=PLANE_PET_UDP_HOST=127.0.0.1
+Environment=PLANE_PET_UDP_PORT=32110
+Environment=PLANE_PET_TOKEN_STORE=/var/lib/plane-pet/gateway_tokens.db
+Environment=PLANE_PET_TELEMETRY_STORE=/var/lib/plane-pet/telemetry.db
+Environment=PLANE_PET_TELEMETRY_RETENTION_DAYS=90
+Environment=PLANE_PET_ADMIN_PASSWORD_FILE=/etc/plane-pet/gateway-admin.password
+Environment=PLANE_PET_MAX_CONNECTIONS=128
+Environment=PLANE_PET_MAX_ENROLLMENTS=1000
+Environment=PLANE_PET_MAX_ENROLLMENTS_PER_IP=8
+ExecStart=/usr/bin/python3 /opt/plane-pet/gateway/plane_pet_gateway.py
+Restart=on-failure
+RestartSec=2
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/plane-pet
+RestrictAddressFamilies=AF_INET AF_UNIX
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

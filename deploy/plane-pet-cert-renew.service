@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew Plane Pet public IP TLS certificate
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/certbot-ip-v5/bin/certbot renew --quiet --no-random-sleep-on-renew --deploy-hook "/bin/systemctl reload nginx"

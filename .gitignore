@@ -1,0 +1,50 @@
+# Build and release output
+/build/
+/dist/
+/out/
+/.vs/
+
+# Compiler and linker artifacts
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.exe
+*.dll
+*.zip
+
+# Python caches and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime state and collected data
+*.binding
+*.settings
+*.history
+*.events.csv
+*.log
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Local credentials and deployment secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+gateway-admin.password
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.old
+*~
+Thumbs.db
+Desktop.ini

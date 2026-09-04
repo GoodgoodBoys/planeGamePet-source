@@ -1,0 +1,4 @@
+1 ICON "assets/plane_pet.ico"
+101 RCDATA "dist/PlanePetServer.exe"
+102 RCDATA "dist/PlanePetAlice.exe"
+103 RCDATA "dist/PlanePetBob.exe"

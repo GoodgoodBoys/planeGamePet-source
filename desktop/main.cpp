@@ -30,8 +30,8 @@
 #include "../common/app_version.h"
 #include "update_manager.h"
 #include "game_layout.h"
-#include "../../shared/plane_protocol.h"
-#include "../../shared/plane_sim.h"
+#include "../shared/plane_protocol.h"
+#include "../shared/plane_sim.h"
 
 namespace {
 

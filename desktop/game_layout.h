@@ -2,7 +2,7 @@
 
 #include <algorithm>
 
-#include "../../shared/plane_sim.h"
+#include "../shared/plane_sim.h"
 
 namespace plane_pet_ui {
 

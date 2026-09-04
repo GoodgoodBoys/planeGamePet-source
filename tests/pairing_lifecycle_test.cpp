@@ -12,7 +12,7 @@
 #include <ws2tcpip.h>
 
 #include "../common/pairing_protocol.h"
-#include "../../shared/plane_protocol.h"
+#include "../shared/plane_protocol.h"
 
 namespace {
 

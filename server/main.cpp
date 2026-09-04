@@ -32,8 +32,8 @@ constexpr SOCKET INVALID_SOCKET = -1;
 #endif
 
 #include "../common/pairing_protocol.h"
-#include "../../shared/plane_protocol.h"
-#include "../../shared/plane_sim.h"
+#include "../shared/plane_protocol.h"
+#include "../shared/plane_sim.h"
 
 namespace {
 

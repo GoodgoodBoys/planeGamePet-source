@@ -1,6 +1,6 @@
 #include <iostream>
 
-#include "../../shared/plane_sim.h"
+#include "../shared/plane_sim.h"
 
 namespace {
 

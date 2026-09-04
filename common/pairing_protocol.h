@@ -6,6 +6,7 @@
 
 #include <string>
 
+#include "app_version.h"
 #include "../../shared/plane_protocol.h"
 
 namespace pcpair {
@@ -157,6 +158,27 @@ enum class Status : uint8_t {
   StorageError = 8,
 };
 
+struct AppVersion {
+  uint8_t major = 0;
+  uint8_t minor = 0;
+  uint8_t patch = 0;
+
+  bool Known() const { return major != 0 || minor != 0 || patch != 0; }
+};
+
+enum CompatibilityFlag : uint8_t {
+  PeerVersionKnown = 1U << 0U,
+  MajorMismatch = 1U << 1U,
+  LocalUpdateRequired = 1U << 2U,
+  PeerUpdateRequired = 1U << 3U,
+  ServerMinimumRequired = 1U << 4U,
+};
+
+inline AppVersion CurrentAppVersion() {
+  return {plane_pet_version::kMajor, plane_pet_version::kMinor,
+          plane_pet_version::kPatch};
+}
+
 struct Message {
   MessageType type = MessageType::Status;
   uint32_t deviceId = 0;
@@ -168,6 +190,8 @@ struct Message {
   uint32_t peerDeviceId = 0;
   Status status = Status::None;
   uint8_t assignedSlot = 0;
+  AppVersion appVersion{};
+  uint8_t compatibilityFlags = 0;
 };
 
 struct RoundMeta {
@@ -223,6 +247,10 @@ inline bool Serialize(const Message &message, uint8_t *bytes, size_t capacity,
   plink::PutU32(bytes + 28, message.peerDeviceId);
   bytes[32] = static_cast<uint8_t>(message.status);
   bytes[33] = message.assignedSlot;
+  bytes[34] = message.appVersion.major;
+  bytes[35] = message.appVersion.minor;
+  bytes[36] = message.appVersion.patch;
+  bytes[37] = message.compatibilityFlags;
   plink::PutU16(bytes + 38, plink::Crc16Ccitt(bytes, 38));
   WriteU64(bytes + 40, key.Enabled() ? SipHash24(bytes, 40, key) : 0);
   return true;
@@ -254,6 +282,8 @@ inline bool Parse(const uint8_t *bytes, size_t length, Message &message,
   message.peerDeviceId = plink::GetU32(bytes + 28);
   message.status = static_cast<Status>(status);
   message.assignedSlot = bytes[33];
+  message.appVersion = {bytes[34], bytes[35], bytes[36]};
+  message.compatibilityFlags = bytes[37];
   return true;
 }
 

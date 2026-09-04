@@ -100,15 +100,23 @@ function Drag-ClientWindowFromPoint($process, [int]$x, [int]$y,
     $startX = $before.Left + $x
     $startY = $before.Top + $y
     [PetInteractionNative]::SetCursorPos($startX, $startY) | Out-Null
+    $downParam = [IntPtr](($y -shl 16) -bor ($x -band 0xffff))
+    $moveX = $x + $deltaX
+    $moveY = $y + $deltaY
+    $moveParam = [IntPtr](($moveY -shl 16) -bor ($moveX -band 0xffff))
     try {
-        [PetInteractionNative]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+        [PetInteractionNative]::SendMessage($process.MainWindowHandle,
+            0x0201, [IntPtr]1, $downParam) | Out-Null
         Start-Sleep -Milliseconds 120
         [PetInteractionNative]::SetCursorPos(
             $startX + $deltaX, $startY + $deltaY) | Out-Null
+        [PetInteractionNative]::SendMessage($process.MainWindowHandle,
+            0x0200, [IntPtr]1, $moveParam) | Out-Null
         Start-Sleep -Milliseconds 180
     }
     finally {
-        [PetInteractionNative]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+        [PetInteractionNative]::SendMessage($process.MainWindowHandle,
+            0x0202, [IntPtr]::Zero, $moveParam) | Out-Null
     }
     $deadline = [DateTime]::UtcNow.AddSeconds(3)
     do {

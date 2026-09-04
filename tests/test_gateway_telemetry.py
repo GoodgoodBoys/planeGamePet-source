@@ -26,10 +26,11 @@ class GatewayTelemetryTest(unittest.TestCase):
 
     @staticmethod
     def packet(event="app_started", event_id=1, value=0,
-               invite="0000000000000000", round_id="0000000000000000"):
+               invite="0000000000000000", round_id="0000000000000000",
+               version="0.6.7"):
         body = {
             "v": 1, "s": "0123456789abcdef", "q": event_id, "t": 1000,
-            "a": "0.6.7", "i": invite, "r": round_id,
+            "a": version, "i": invite, "r": round_id,
             "e": event, "x": value,
         }
         return gateway.TELEMETRY_MAGIC + json.dumps(
@@ -93,6 +94,28 @@ class GatewayTelemetryTest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertRegex(first, r"^h:[0-9a-f]{24}$")
         self.assertNotIn("203.0.113.25", first)
+
+    def test_update_events_coexist_with_older_statistics(self):
+        digest = "d" * 64
+        self.assertTrue(gateway.store_telemetry(
+            digest, self.packet("app_started", 1, version="0.6.7"), 2000))
+        update_events = (
+            "update_check", "update_available", "update_accepted",
+            "update_install_succeeded", "forced_update_required")
+        for event_id, event in enumerate(update_events, 2):
+            self.assertTrue(gateway.store_telemetry(
+                digest, self.packet(event, event_id, version="1.0.0"),
+                2000 + event_id))
+        snapshot = gateway.analytics_snapshot(4000)
+        self.assertEqual(snapshot["sessions"], 1)
+        self.assertEqual(snapshot["update_checks"], 1)
+        self.assertEqual(snapshot["update_available"], 1)
+        self.assertEqual(snapshot["update_accepted"], 1)
+        self.assertEqual(snapshot["update_installed"], 1)
+        self.assertEqual(snapshot["forced_updates"], 1)
+        page = gateway.render_admin_page().decode()
+        self.assertIn("更新成功", page)
+        self.assertIn("强制兼容更新", page)
 
 
 if __name__ == "__main__":

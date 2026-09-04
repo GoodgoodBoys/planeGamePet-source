@@ -68,6 +68,7 @@ void SendPairStart(TestClient &client) {
   message.deviceId = client.clientId;
   message.requestId = client.pairingRequestId;
   message.pairingCode = client.pairingCode;
+  message.appVersion = pcpair::CurrentAppVersion();
   if (pcpair::Serialize(message, bytes, sizeof(bytes)))
     SendRaw(client, bytes, sizeof(bytes));
 }
@@ -80,6 +81,7 @@ void SendResume(TestClient &client) {
   message.bindingId = client.bindingId;
   message.tokenLow = client.tokenLow;
   message.tokenHigh = client.tokenHigh;
+  message.appVersion = pcpair::CurrentAppVersion();
   if (pcpair::Serialize(message, bytes, sizeof(bytes)))
     SendRaw(client, bytes, sizeof(bytes));
 }

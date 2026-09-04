@@ -2,6 +2,7 @@
 /build/
 /dist/
 /out/
+/release_out/
 /.vs/
 
 # Compiler and linker artifacts

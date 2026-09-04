@@ -69,6 +69,13 @@ ALLOWED_EVENTS = frozenset({
     "history_recorded", "pet_hidden", "pet_shown", "game_hidden",
     "game_restored", "dnd_enabled", "dnd_disabled",
     "quick_emote_sent", "quick_emote_received",
+    "update_check", "update_available", "update_accepted",
+    "update_declined", "update_download_started",
+    "update_download_completed", "update_verify_failed",
+    "update_install_started", "update_install_succeeded",
+    "update_install_failed", "update_rollback",
+    "peer_version_mismatch", "peer_version_compatible",
+    "forced_update_required",
 })
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -343,6 +350,14 @@ def analytics_snapshot(now_ms=None):
         "emotes_sent": _count("quick_emote_sent"),
         "emotes_received": _count("quick_emote_received"),
         "emote_users": emote_users, "emote_counts": emote_counts,
+        "update_checks": _count("update_check"),
+        "update_available": _count("update_available"),
+        "update_accepted": _count("update_accepted"),
+        "update_installed": _count("update_install_succeeded"),
+        "update_failed": _count("update_verify_failed") +
+                         _count("update_install_failed"),
+        "update_rollbacks": _count("update_rollback"),
+        "forced_updates": _count("forced_update_required"),
         "daily": daily, "recent": recent,
     }
 
@@ -362,6 +377,13 @@ def render_admin_page() -> bytes:
         ("平均对局时长", _format_duration(data["game_average"])),
         ("快捷表情发送", data["emotes_sent"]),
         ("快捷表情用户", data["emote_users"]),
+        ("检查更新", data["update_checks"]),
+        ("发现更新", data["update_available"]),
+        ("同意更新", data["update_accepted"]),
+        ("更新成功", data["update_installed"]),
+        ("更新失败", data["update_failed"]),
+        ("自动回滚", data["update_rollbacks"]),
+        ("强制兼容更新", data["forced_updates"]),
     ]
     card_html = "".join(
         f'<div class="card"><span>{html.escape(str(label))}</span>'

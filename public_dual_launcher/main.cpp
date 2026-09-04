@@ -105,7 +105,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   }
 
   const std::filesystem::path data = DataDirectory();
-  const std::filesystem::path runtime = data / L"runtime-public-dual-0.6.7";
+  const std::filesystem::path runtime = data / L"runtime-public-dual-1.0.0";
   std::error_code error;
   std::filesystem::create_directories(runtime, error);
   const std::filesystem::path tunnel = runtime / L"PlanePetTunnel.exe";

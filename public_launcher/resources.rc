@@ -1,3 +1,4 @@
 1 ICON "assets/plane_pet.ico"
 201 RCDATA "dist/PlanePetTunnel.exe"
 202 RCDATA "dist/PlanePetClient.exe"
+203 RCDATA "dist/PlanePetUpdater.exe"

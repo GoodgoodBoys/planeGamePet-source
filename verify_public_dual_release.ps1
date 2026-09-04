@@ -1,6 +1,6 @@
 ﻿param(
     [string]$Archive = "",
-    [string]$ExpectedVersion = "0.6.7"
+    [string]$ExpectedVersion = "1.0.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -45,11 +45,14 @@ try {
     }
     $unicode = [Text.Encoding]::Unicode.GetString($bytes)
     foreach ($marker in @(
-            "runtime-public-dual-$ExpectedVersion", "PlanePetPublicDualLauncher",
+            "runtime-public-dual-", "PlanePetPublicDualLauncher",
             "PlanePetTunnel.exe", "PlanePetClient.exe")) {
         if (-not $unicode.Contains($marker)) {
             throw "Missing embedded dual-launcher marker: $marker"
         }
+    }
+    if (-not $unicode.Contains($ExpectedVersion)) {
+        throw "Missing embedded application version: $ExpectedVersion"
     }
     $instructions = Get-Content -Raw -LiteralPath `
         (Join-Path $testRoot "使用说明.txt")

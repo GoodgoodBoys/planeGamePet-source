@@ -26,9 +26,10 @@ finally {
 }
 & $Compiler "-B$compilerBin\" -std=c++17 -O2 -Wall -Wextra -static -static-libgcc `
     -static-libstdc++ -DPLANE_PET_RENDER_SELF_TEST `
-    (Join-Path $root "desktop\main.cpp") $resourceObject `
+    (Join-Path $root "desktop\main.cpp") `
+    (Join-Path $root "desktop\update_manager.cpp") $resourceObject `
     -o $testExe -mwindows -lws2_32 -lgdi32 -lgdiplus -lole32 `
-    -lshell32 -lcomdlg32 -lbcrypt
+    -lshell32 -lcomdlg32 -lwinhttp -lcrypt32 -lbcrypt
 if ($LASTEXITCODE -ne 0) {
     throw "Render self-test build failed with exit code $LASTEXITCODE"
 }

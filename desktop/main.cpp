@@ -27,6 +27,8 @@
 #include <bcrypt.h>
 
 #include "../common/pairing_protocol.h"
+#include "../common/app_version.h"
+#include "update_manager.h"
 #include "game_layout.h"
 #include "../../shared/plane_protocol.h"
 #include "../../shared/plane_sim.h"
@@ -50,6 +52,7 @@ constexpr UINT kMenuClearLocalData = 2010;
 constexpr UINT kMenuExportData = 2011;
 constexpr UINT kMenuTelemetry = 2012;
 constexpr UINT kMenuPairingPanel = 2013;
+constexpr UINT kMenuCheckUpdate = 2014;
 constexpr int kBossHotkeyId = 1;
 constexpr COLORREF kTransparent = RGB(1, 2, 3);
 constexpr COLORREF kBlue = RGB(0, 180, 255);
@@ -73,8 +76,15 @@ constexpr uint32_t kInviteFeedbackSeconds = 5;
 constexpr uint32_t kEmoteDisplayMilliseconds = 3500;
 constexpr wchar_t kWindowClassName[] = L"PlanePetLocalTestWindow";
 constexpr wchar_t kInfoWindowClassName[] = L"PlanePetInfoWindow";
-constexpr char kAppVersion[] = "0.6.7";
+constexpr wchar_t kUpdateWindowClassName[] = L"PlanePetUpdateCardWindow";
+constexpr const char *kAppVersion = plane_pet_version::kString;
 constexpr char kTelemetryMagic[] = "PPTELEM1\n";
+constexpr int kUpdateInstallExitCode = 73;
+
+void ShowUpdateWindow(HWND owner, bool activate);
+void CloseUpdateWindow();
+void RepositionUpdateWindow(HWND owner);
+int gProcessExitCode = 0;
 
 class GdiPlusSession {
  public:
@@ -282,6 +292,16 @@ class PetClient {
     historyPath_ = statePath_.parent_path() /
                    (statePath_.stem().wstring() + L".history");
     LoadHistory();
+    const bool updatesEnabled =
+        atoi(Option("update-enabled", "0").c_str()) != 0;
+    const std::string updateManifest = Option("update-manifest", "");
+    const std::wstring configuredUpdateRequest =
+        Wide(Option("update-request", ""));
+    updateRequestPath_ = configuredUpdateRequest.empty()
+        ? statePath_.parent_path() / L"update.request"
+        : std::filesystem::path(configuredUpdateRequest);
+    updateManager_.Configure(window_, updateManifest, updateRequestPath_,
+                             updatesEnabled, updateSnoozeUntilMs_);
     if (configuredClientId != 0 && configuredClientId != clientId_) {
       clientId_ = configuredClientId;
       ClearBinding();
@@ -317,6 +337,12 @@ class PetClient {
     ioctlsocket(socket_, FIONBIO, &enabled);
     if (!ResolveServer()) return false;
     LogEvent("app_started", bindingId_ != 0 ? 1 : 0);
+    if (atoi(Option("update-installed", "0").c_str()) != 0)
+      LogEvent("update_install_succeeded");
+    if (atoi(Option("update-rollback", "0").c_str()) != 0)
+      LogEvent("update_rollback");
+    if (atoi(Option("update-failed", "0").c_str()) != 0)
+      LogEvent("update_install_failed");
     ResetPrediction();
     nextPairing_ = nextInput_ = nextPing_ = nextPrediction_ = Clock::now();
     nextTelemetryHeartbeat_ = Clock::now() + std::chrono::seconds(60);
@@ -343,6 +369,33 @@ class PetClient {
   void Update() {
     ReceiveAll();
     const auto now = Clock::now();
+    updateManager_.Tick(!gameMode_, peerVersionDiffers_,
+                        localUpdateRequired_, majorVersionMismatch_);
+    const auto update = updateManager_.GetSnapshot();
+    if (update.generation != lastUpdateGeneration_) {
+      lastUpdateGeneration_ = update.generation;
+      if (update.state == plane_pet_update::State::Checking)
+        LogEvent("update_check", update.manual ? 1 : 0);
+      else if (update.state == plane_pet_update::State::Downloading)
+        LogEvent("update_download_started", update.required ? 1 : 0);
+      else if (update.state == plane_pet_update::State::Error)
+        LogEvent("update_verify_failed");
+      const bool important = update.required;
+      const bool shouldShow = update.manual || important ||
+          (!hiddenByUser_ && update.state == plane_pet_update::State::Available);
+      const bool informative = update.manual &&
+          (update.state == plane_pet_update::State::Checking ||
+           update.state == plane_pet_update::State::Current ||
+           update.state == plane_pet_update::State::Error);
+      if (!gameMode_ && (shouldShow || informative)) {
+        if (important && hiddenByUser_) ShowPet();
+        ShowUpdateWindow(window_, update.manual);
+        if (update.state == plane_pet_update::State::Available ||
+            update.state == plane_pet_update::State::Required)
+          LogEvent("update_available", update.required ? 1 : 0);
+      }
+    }
+    if (!gameMode_) RepositionUpdateWindow(window_);
     if (!inviteFeedback_.empty() && now >= inviteFeedbackUntil_) {
       inviteFeedback_.clear();
       inviteFeedbackUntil_ = Clock::time_point{};
@@ -557,20 +610,21 @@ class PetClient {
             L"需要专注时，可在右键菜单开启“暂停接收邀请”。对方的邀请会被自动拒绝，桌宠不会突然弹出；再次点击即可恢复。", 54);
     section(L"10 · 隐私与本地数据",
             L"同意后会记录启动和使用时长、匹配及在线状态变化、邀请响应、显示/隐藏与勿扰状态、四种表情类型和对局过程/结果。不记录聊天文字、匹配码、姓名、键鼠轨迹、屏幕内容或窗口标题；服务器原始事件最长保留 90 天。即使关闭统计，联网必需的匿名绑定和鉴权凭据仍会保存。", 114);
+    section(L"11 · 软件更新",
+            L"右键选择“检查软件更新…”可随时手动检查。非必要更新可选择 7 天后提醒；双方大版本不同时，联机邀请会暂停，旧版一方需升级。下载包和更新清单都会经过校验，启动失败会自动还原旧版。", 76);
   }
 
   void OnLeftButtonDown(int x, int y) {
     const auto dragPetWindow = [&]() {
       SetForegroundWindow(window_);
-      ReleaseCapture();
-      POINT cursor{};
-      GetCursorPos(&cursor);
-      SendMessageW(window_, WM_NCLBUTTONDOWN, HTCAPTION,
-                   MAKELPARAM(cursor.x, cursor.y));
+      petDragHasScreenCursor_ = GetCursorPos(&petDragStartCursor_) != FALSE;
+      petDragStartClient_ = POINT{x, y};
       RECT rect{};
       GetWindowRect(window_, &rect);
-      petX_ = rect.left;
-      petY_ = rect.top;
+      petDragStartX_ = rect.left;
+      petDragStartY_ = rect.top;
+      petWindowDragging_ = true;
+      SetCapture(window_);
     };
 
     if (awaitingPairing_ || pairingAttempted_) {
@@ -624,16 +678,37 @@ class PetClient {
   }
 
   void OnMouseMove(int x, int y) {
-    if (gameMode_ && mouseDragging_) SetMouseTarget(x, y);
+    if (gameMode_ && mouseDragging_) {
+      SetMouseTarget(x, y);
+    } else if (!gameMode_ && petWindowDragging_) {
+      POINT cursor{};
+      if (petDragHasScreenCursor_ && GetCursorPos(&cursor)) {
+        petX_ = petDragStartX_ + cursor.x - petDragStartCursor_.x;
+        petY_ = petDragStartY_ + cursor.y - petDragStartCursor_.y;
+      } else {
+        petX_ = petDragStartX_ + x - petDragStartClient_.x;
+        petY_ = petDragStartY_ + y - petDragStartClient_.y;
+      }
+      SetWindowPos(window_, nullptr, petX_, petY_, 0, 0,
+                   SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
   }
 
   void OnLeftButtonUp() {
+    if (petWindowDragging_) {
+      petWindowDragging_ = false;
+      if (GetCapture() == window_) ReleaseCapture();
+      return;
+    }
     if (!mouseDragging_) return;
     mouseDragging_ = false;
     if (GetCapture() == window_) ReleaseCapture();
   }
 
-  void OnCaptureChanged() { mouseDragging_ = false; }
+  void OnCaptureChanged() {
+    mouseDragging_ = false;
+    petWindowDragging_ = false;
+  }
 
   bool IsInteractivePetPoint(int x, int y) const {
     if (gameMode_) return true;
@@ -704,6 +779,7 @@ class PetClient {
 
   void HideByUser() {
     CloseInfoWindow();
+    CloseUpdateWindow();
     if (gameMode_) {
       EmergencyHide();
       return;
@@ -734,6 +810,7 @@ class PetClient {
 
   void EmergencyHide() {
     CloseInfoWindow();
+    CloseUpdateWindow();
     const bool hidingGame = gameMode_;
     mouseDragging_ = false;
     currentInput_ = 0;
@@ -771,6 +848,41 @@ class PetClient {
     return telemetryEnabled_ &&
            (!telemetryUploadCapable_ || telemetryUploadChoice_ == 1);
   }
+  bool UpdatesEnabled() const { return updateManager_.Enabled(); }
+  bool IsPetHidden() const { return hiddenByUser_; }
+  plane_pet_update::Snapshot UpdateSnapshot() const {
+    return updateManager_.GetSnapshot();
+  }
+  void ManualUpdateCheck() {
+    if (!updateManager_.Enabled()) return;
+    updateManager_.CheckNow();
+    ShowUpdateWindow(window_, true);
+  }
+  void AcceptUpdate() {
+    const auto state = updateManager_.GetSnapshot();
+    LogEvent("update_accepted", state.required ? 1 : 0);
+    updateManager_.AcceptAndDownload();
+  }
+  void DeclineOrDismissUpdate() {
+    const auto state = updateManager_.GetSnapshot();
+    if (state.state == plane_pet_update::State::Available && !state.required) {
+      updateSnoozeUntilMs_ =
+          UnixTimeMillis() + 7ULL * 24ULL * 60ULL * 60ULL * 1000ULL;
+      updateManager_.SetOptionalSnoozeUntil(updateSnoozeUntilMs_);
+      SaveSettings();
+      LogEvent("update_declined", 7);
+    } else {
+      updateManager_.Dismiss();
+    }
+    CloseUpdateWindow();
+  }
+  void BeginUpdateInstall() {
+    if (!updateManager_.HasInstallRequest()) return;
+    LogEvent("update_download_completed");
+    LogEvent("update_install_started");
+    gProcessExitCode = kUpdateInstallExitCode;
+    DestroyWindow(window_);
+  }
   void ToggleTelemetry() {
     if (IsTelemetryEnabled()) {
       telemetryEnabled_ = false;
@@ -798,7 +910,7 @@ class PetClient {
   bool CanInvite() const {
     return !gameMode_ && !awaitingPairing_ && !pairingAttempted_ &&
            session_ != 0 && Phase() == plink::GamePhase::Menu &&
-           OpponentOnline();
+           OpponentOnline() && !majorVersionMismatch_;
   }
   bool CanSendQuickEmote() const { return CanInvite(); }
   void InviteFromMenu() {
@@ -891,14 +1003,20 @@ class PetClient {
     }
     HGDIOBJ oldBitmap = SelectObject(memory, bitmap);
     DrawGameHud(memory, 1, 0, 0, 0);
-    const COLORREF ownHeart = GetPixel(memory, 29, 21);
-    const COLORREF peerHeart = GetPixel(memory, 190, 21);
+    unsigned bluePixels = 0;
+    unsigned redPixels = 0;
+    for (int y = 12; y < 38; ++y) {
+      for (int x = 22; x < 76; ++x)
+        if (GetPixel(memory, x, y) == kBlue) ++bluePixels;
+      for (int x = 184; x < 238; ++x)
+        if (GetPixel(memory, x, y) == kRed) ++redPixels;
+    }
     SelectObject(memory, oldBitmap);
     DeleteObject(bitmap);
     DeleteDC(memory);
     ReleaseDC(window_, target);
     snapshot_.phase = plink::GamePhase::Menu;
-    return ownHeart == kBlue && peerHeart == kRed;
+    return bluePixels >= 20U && redPixels >= 20U;
   }
 
   bool RunFinishedCloseSelfTest() {
@@ -1305,6 +1423,7 @@ class PetClient {
     int upload = -1;
     int dnd = 0;
     int pairingPanel = 1;
+    unsigned long long updateSnooze = 0;
     if (!(input >> magic >> version) || magic != "PLANE_PET_SETTINGS") return;
     if (version == 1 && input >> telemetry >> dnd &&
         telemetry >= 0 && telemetry <= 1 && dnd >= 0 && dnd <= 1) {
@@ -1321,6 +1440,17 @@ class PetClient {
       doNotDisturb_ = dnd != 0;
       if (input >> pairingPanel && pairingPanel >= 0 && pairingPanel <= 1)
         pairingPanelVisible_ = pairingPanel != 0;
+    } else if (version == 3 && input >> telemetry >> upload >> dnd >>
+                   pairingPanel >> updateSnooze &&
+               telemetry >= 0 && telemetry <= 1 && upload >= -1 &&
+               upload <= 1 && dnd >= 0 && dnd <= 1 &&
+               pairingPanel >= 0 && pairingPanel <= 1) {
+      telemetryChoiceKnown_ = true;
+      telemetryEnabled_ = telemetry != 0;
+      telemetryUploadChoice_ = upload;
+      doNotDisturb_ = dnd != 0;
+      pairingPanelVisible_ = pairingPanel != 0;
+      updateSnoozeUntilMs_ = updateSnooze;
     }
   }
 
@@ -1331,10 +1461,11 @@ class PetClient {
     const std::filesystem::path temporary = settingsPath_.wstring() + L".tmp";
     std::ofstream output(temporary, std::ios::trunc);
     if (!output) return false;
-    output << "PLANE_PET_SETTINGS 2 " << (telemetryEnabled_ ? 1 : 0)
+    output << "PLANE_PET_SETTINGS 3 " << (telemetryEnabled_ ? 1 : 0)
            << ' ' << telemetryUploadChoice_
            << ' ' << (doNotDisturb_ ? 1 : 0)
-           << ' ' << (pairingPanelVisible_ ? 1 : 0) << '\n';
+           << ' ' << (pairingPanelVisible_ ? 1 : 0)
+           << ' ' << updateSnoozeUntilMs_ << '\n';
     output.close();
     if (!output) return false;
     return MoveFileExW(temporary.c_str(), settingsPath_.c_str(),
@@ -1659,6 +1790,7 @@ class PetClient {
   void SendControl(pcpair::Message message) {
     uint8_t bytes[pcpair::kMessageSize]{};
     message.deviceId = clientId_;
+    message.appVersion = pcpair::CurrentAppVersion();
     if (pcpair::Serialize(message, bytes, sizeof(bytes), networkKey_)) {
       sendto(socket_, reinterpret_cast<const char *>(bytes), sizeof(bytes), 0,
              reinterpret_cast<const sockaddr *>(&server_), sizeof(server_));
@@ -1821,6 +1953,30 @@ class PetClient {
     if (message.type != pcpair::MessageType::Status ||
         message.deviceId != clientId_) return;
     lastPacketAt_ = Clock::now();
+    const auto applyPeerVersion = [&]() {
+      const bool wasForcedUpdate =
+          majorVersionMismatch_ && localUpdateRequired_;
+      peerAppVersion_ = message.appVersion;
+      peerVersionKnown_ =
+          (message.compatibilityFlags & pcpair::PeerVersionKnown) != 0 &&
+          message.appVersion.Known();
+      peerVersionDiffers_ = peerVersionKnown_ &&
+          (message.appVersion.major != plane_pet_version::kMajor ||
+           message.appVersion.minor != plane_pet_version::kMinor ||
+           message.appVersion.patch != plane_pet_version::kPatch);
+      const bool mismatch =
+          (message.compatibilityFlags & pcpair::MajorMismatch) != 0;
+      if (mismatch != majorVersionMismatch_) {
+        majorVersionMismatch_ = mismatch;
+        LogEvent(mismatch ? "peer_version_mismatch"
+                          : "peer_version_compatible",
+                 peerVersionKnown_ ? message.appVersion.major : 0);
+      }
+      localUpdateRequired_ =
+          (message.compatibilityFlags & pcpair::LocalUpdateRequired) != 0;
+      if (mismatch && localUpdateRequired_ && !wasForcedUpdate)
+        LogEvent("forced_update_required", message.appVersion.major);
+    };
     if (message.status == pcpair::Status::Waiting && pairingAttempted_ &&
         message.requestId == pairingRequestId_) {
       serverConfirmedWaiting_ = true;
@@ -1829,6 +1985,7 @@ class PetClient {
                message.bindingId != 0 && message.assignedSlot >= 1 &&
                message.assignedSlot <= 2) {
       bindingId_ = message.bindingId;
+      applyPeerVersion();
       tokenLow_ = message.tokenLow;
       tokenHigh_ = message.tokenHigh;
       peerDeviceId_ = message.peerDeviceId;
@@ -1853,6 +2010,15 @@ class PetClient {
       LogEvent("pairing_matched", slot_);
       SetPetMode(true);
       SendResume();
+    } else if (message.status == pcpair::Status::Matched &&
+               bindingId_ != 0 && message.bindingId == bindingId_) {
+      applyPeerVersion();
+      if (majorVersionMismatch_) {
+        connectionNotice_ = localUpdateRequired_
+            ? L"双方大版本不同\n请检查软件更新"
+            : L"好友版本较旧\n暂不能邀请对战";
+        connectionNoticeUntil_ = Clock::now() + std::chrono::seconds(12);
+      }
     } else if (message.status == pcpair::Status::Cancelled &&
                message.requestId == pairingRequestId_) {
       pairingAttempted_ = false;
@@ -2274,6 +2440,7 @@ class PetClient {
 
   void SetGameMode() {
     CloseInfoWindow();
+    CloseUpdateWindow();
     if (!gameMode_) {
       RECT pet{};
       GetWindowRect(window_, &pet);
@@ -3301,6 +3468,7 @@ class PetClient {
   std::filesystem::path eventsPath_;
   std::filesystem::path historyPath_;
   std::filesystem::path settingsPath_;
+  std::filesystem::path updateRequestPath_;
   std::wstring ownName_;
   std::wstring peerName_;
   Clock::time_point start_{};
@@ -3349,6 +3517,8 @@ class PetClient {
   uint64_t lastRecordedRoundId_ = 0;
   uint64_t telemetrySessionId_ = 0;
   uint64_t telemetryEventSequence_ = 0;
+  uint64_t updateSnoozeUntilMs_ = 0;
+  uint64_t lastUpdateGeneration_ = 0;
   uint8_t slot_ = 1;
   uint8_t currentInput_ = 0;
   uint8_t inputHistory_[3]{};
@@ -3365,6 +3535,12 @@ class PetClient {
   bool returnToPetRequested_ = false;
   bool gameMode_ = false;
   bool mouseDragging_ = false;
+  bool petWindowDragging_ = false;
+  POINT petDragStartCursor_{};
+  POINT petDragStartClient_{};
+  bool petDragHasScreenCursor_ = false;
+  int petDragStartX_ = 0;
+  int petDragStartY_ = 0;
   bool autoInvite_ = false;
   bool autoAccept_ = false;
   bool testAutoUnbind_ = false;
@@ -3388,8 +3564,14 @@ class PetClient {
   bool statePersistenceOk_ = true;
   bool stateRecoveredFromBackup_ = false;
   bool abandonedMatch_ = false;
+  pcpair::AppVersion peerAppVersion_{};
+  bool peerVersionKnown_ = false;
+  bool peerVersionDiffers_ = false;
+  bool majorVersionMismatch_ = false;
+  bool localUpdateRequired_ = false;
   bool peerOnlineKnown_ = false;
   bool lastPeerOnline_ = false;
+  plane_pet_update::Manager updateManager_{};
   mutable EmbeddedImageResource emojiImages_[4];
   mutable EmbeddedImageResource petPlaneImages_[2];
   mutable EmbeddedImageResource petCloudImages_[3];
@@ -3402,6 +3584,192 @@ PetClient gClient;
 NOTIFYICONDATAW gTray{};
 bool gTrayAdded = false;
 HWND gInfoWindow = nullptr;
+HWND gUpdateWindow = nullptr;
+
+void UpdateCardText(HDC dc, const std::wstring &text, RECT rect, int height,
+                    COLORREF color, int weight = FW_NORMAL,
+                    UINT format = DT_LEFT | DT_VCENTER | DT_SINGLELINE) {
+  SetBkMode(dc, TRANSPARENT);
+  SetTextColor(dc, color);
+  HFONT font = CreateFontW(height, 0, 0, 0, weight, FALSE, FALSE, FALSE,
+                           DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                           CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                           DEFAULT_PITCH | FF_DONTCARE,
+                           L"Microsoft YaHei UI");
+  HGDIOBJ previous = SelectObject(dc, font);
+  DrawTextW(dc, text.c_str(), static_cast<int>(text.size()), &rect, format);
+  SelectObject(dc, previous);
+  DeleteObject(font);
+}
+
+void UpdateCardPanel(HDC dc, RECT rect, COLORREF fill, COLORREF edge) {
+  HBRUSH brush = CreateSolidBrush(fill);
+  HPEN pen = CreatePen(PS_SOLID, 1, edge);
+  HGDIOBJ oldBrush = SelectObject(dc, brush);
+  HGDIOBJ oldPen = SelectObject(dc, pen);
+  RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 14, 14);
+  SelectObject(dc, oldPen);
+  SelectObject(dc, oldBrush);
+  DeleteObject(pen);
+  DeleteObject(brush);
+}
+
+constexpr int kUpdateCardWidth = 360;
+constexpr int kUpdateCardHeight = 244;
+constexpr RECT kUpdatePrimaryButton{24, 194, 171, 229};
+constexpr RECT kUpdateSecondaryButton{189, 194, 336, 229};
+constexpr RECT kUpdateCloseButton{326, 12, 348, 34};
+
+void RepositionUpdateWindow(HWND owner) {
+  if (gUpdateWindow == nullptr || !IsWindow(gUpdateWindow) ||
+      !IsWindowVisible(gUpdateWindow)) return;
+  RECT pet{};
+  GetWindowRect(owner, &pet);
+  MONITORINFO monitor{};
+  monitor.cbSize = sizeof(monitor);
+  GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &monitor);
+  int x = pet.right + 8;
+  if (x + kUpdateCardWidth > monitor.rcWork.right)
+    x = pet.left - kUpdateCardWidth - 8;
+  x = std::clamp(x, static_cast<int>(monitor.rcWork.left),
+                 std::max(static_cast<int>(monitor.rcWork.left),
+                          static_cast<int>(monitor.rcWork.right) -
+                              kUpdateCardWidth));
+  const int y = std::clamp(
+      static_cast<int>(pet.top), static_cast<int>(monitor.rcWork.top),
+      std::max(static_cast<int>(monitor.rcWork.top),
+               static_cast<int>(monitor.rcWork.bottom) - kUpdateCardHeight));
+  SetWindowPos(gUpdateWindow, HWND_TOPMOST, x, y, kUpdateCardWidth,
+               kUpdateCardHeight, SWP_NOACTIVATE);
+  InvalidateRect(gUpdateWindow, nullptr, FALSE);
+}
+
+void CloseUpdateWindow() {
+  if (gUpdateWindow != nullptr && IsWindow(gUpdateWindow))
+    DestroyWindow(gUpdateWindow);
+  gUpdateWindow = nullptr;
+}
+
+LRESULT CALLBACK UpdateWindowProcedure(HWND window, UINT message,
+                                       WPARAM wParam, LPARAM lParam) {
+  switch (message) {
+    case WM_PAINT: {
+      PAINTSTRUCT paint{};
+      HDC dc = BeginPaint(window, &paint);
+      RECT client{};
+      GetClientRect(window, &client);
+      HBRUSH background = CreateSolidBrush(RGB(11, 16, 27));
+      FillRect(dc, &client, background);
+      DeleteObject(background);
+      const auto state = gClient.UpdateSnapshot();
+      RECT card{1, 1, client.right - 1, client.bottom - 1};
+      UpdateCardPanel(dc, card, RGB(19, 25, 39), RGB(74, 102, 145));
+      RECT title{22, 13, 321, 42};
+      UpdateCardText(dc,
+                     state.state == plane_pet_update::State::Required
+                         ? L"需要更新 Plane Pet"
+                         : L"Plane Pet 软件更新",
+                     title, 23,
+                     state.required ? RGB(255, 215, 70) : kBlueLight,
+                     FW_BOLD);
+      RECT close = kUpdateCloseButton;
+      UpdateCardText(dc, L"×", close, 24, RGB(180, 194, 218), FW_BOLD,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      RECT messageRect{23, 49, 337, 78};
+      UpdateCardText(dc, state.message, messageRect, 18, kWhite, FW_BOLD);
+      if (!state.latestVersion.empty()) {
+        const std::wstring versions = L"当前 " + state.currentVersion +
+            L"   ·   最新 " + state.latestVersion;
+        RECT versionRect{23, 78, 337, 104};
+        UpdateCardText(dc, versions, versionRect, 16, kMuted);
+      }
+      int summaryY = 105;
+      for (const std::wstring &line : state.summary) {
+        if (line.empty()) continue;
+        RECT summaryRect{27, summaryY, 337, summaryY + 25};
+        UpdateCardText(dc, L"• " + line, summaryRect, 16,
+                       RGB(215, 226, 244));
+        summaryY += 24;
+      }
+      if (state.state == plane_pet_update::State::Downloading) {
+        RECT track{24, 151, 336, 169};
+        UpdateCardPanel(dc, track, RGB(41, 49, 66), RGB(66, 80, 105));
+        RECT bar = track;
+        bar.right = bar.left + static_cast<int>(
+            (bar.right - bar.left) *
+            std::min(100U, state.progressPercent) / 100U);
+        if (bar.right > bar.left)
+          UpdateCardPanel(dc, bar, RGB(35, 199, 132), RGB(35, 199, 132));
+      } else if (state.state == plane_pet_update::State::Available ||
+                 (state.state == plane_pet_update::State::Required &&
+                  !state.latestVersion.empty())) {
+        UpdateCardPanel(dc, kUpdatePrimaryButton, RGB(23, 150, 105),
+                        RGB(74, 236, 169));
+        UpdateCardText(dc, L"下载并升级", kUpdatePrimaryButton, 18, kWhite,
+                       FW_BOLD, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        UpdateCardPanel(dc, kUpdateSecondaryButton, RGB(57, 46, 52),
+                        state.required ? RGB(240, 163, 83) : kCardEdge);
+        UpdateCardText(dc,
+                       state.required ? L"暂时离线使用" : L"7 天后提醒",
+                       kUpdateSecondaryButton, 17, kWhite, FW_BOLD,
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      } else if (state.state == plane_pet_update::State::Error) {
+        UpdateCardPanel(dc, kUpdatePrimaryButton, RGB(38, 81, 120), kBlue);
+        UpdateCardText(dc, L"重新检查", kUpdatePrimaryButton, 18, kWhite,
+                       FW_BOLD, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        UpdateCardPanel(dc, kUpdateSecondaryButton, RGB(43, 49, 63),
+                        kCardEdge);
+        UpdateCardText(dc, L"关闭", kUpdateSecondaryButton, 18, kWhite,
+                       FW_BOLD, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      }
+      EndPaint(window, &paint);
+      return 0;
+    }
+    case WM_LBUTTONUP: {
+      POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+      const auto state = gClient.UpdateSnapshot();
+      if (PtInRect(&kUpdateCloseButton, point)) {
+        gClient.DeclineOrDismissUpdate();
+      } else if ((state.state == plane_pet_update::State::Available ||
+                  state.state == plane_pet_update::State::Required) &&
+                 !state.latestVersion.empty() &&
+                 PtInRect(&kUpdatePrimaryButton, point)) {
+        gClient.AcceptUpdate();
+      } else if (state.state == plane_pet_update::State::Error &&
+                 PtInRect(&kUpdatePrimaryButton, point)) {
+        gClient.ManualUpdateCheck();
+      } else if (PtInRect(&kUpdateSecondaryButton, point)) {
+        gClient.DeclineOrDismissUpdate();
+      }
+      return 0;
+    }
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_CLOSE:
+    case kEmergencyHideMessage:
+      gClient.DeclineOrDismissUpdate();
+      return 0;
+    case WM_DESTROY:
+      if (window == gUpdateWindow) gUpdateWindow = nullptr;
+      return 0;
+    default:
+      return DefWindowProcW(window, message, wParam, lParam);
+  }
+}
+
+void ShowUpdateWindow(HWND owner, bool activate) {
+  if (gUpdateWindow == nullptr || !IsWindow(gUpdateWindow)) {
+    gUpdateWindow = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kUpdateWindowClassName,
+        L"Plane Pet 软件更新", WS_POPUP, 0, 0, kUpdateCardWidth,
+        kUpdateCardHeight, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+  }
+  if (gUpdateWindow == nullptr) return;
+  RepositionUpdateWindow(owner);
+  ShowWindow(gUpdateWindow, activate ? SW_SHOWNORMAL : SW_SHOWNOACTIVATE);
+  InvalidateRect(gUpdateWindow, nullptr, FALSE);
+  if (activate) SetForegroundWindow(gUpdateWindow);
+}
 
 HICON PlanePetIcon(int width, int height) {
   HICON icon = static_cast<HICON>(LoadImageW(
@@ -3423,7 +3791,7 @@ constexpr int kHistoryWidth = 560;
 constexpr int kHistoryContentHeight = 600;
 constexpr int kHelpWidth = 700;
 constexpr int kHelpViewportHeight = 740;
-constexpr int kHelpContentHeight = 1140;
+constexpr int kHelpContentHeight = 1260;
 
 int InfoBaseWidth() {
   return gInfoWindowMode == InfoWindowMode::History
@@ -3660,6 +4028,9 @@ void ShowPetContextMenu(HWND window) {
   AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
   AppendMenuW(menu, MF_STRING, kMenuHistory, L"历史战绩");
   AppendMenuW(menu, MF_STRING, kMenuHelp, L"操作帮助");
+  AppendMenuW(menu,
+              MF_STRING | (gClient.UpdatesEnabled() ? MF_ENABLED : MF_GRAYED),
+              kMenuCheckUpdate, L"检查软件更新…");
   AppendMenuW(menu, MF_STRING | (gClient.IsDoNotDisturb() ? MF_CHECKED : 0),
               kMenuDoNotDisturb, L"暂停接收邀请");
   AppendMenuW(menu, MF_STRING | (gClient.IsTelemetryEnabled() ? MF_CHECKED : 0),
@@ -3753,6 +4124,10 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kMenuHistory, L"历史战绩");
         AppendMenuW(menu, MF_STRING, kMenuHelp, L"操作帮助");
+        AppendMenuW(
+            menu,
+            MF_STRING | (gClient.UpdatesEnabled() ? MF_ENABLED : MF_GRAYED),
+            kMenuCheckUpdate, L"检查软件更新…");
         AppendMenuW(menu,
                     MF_STRING | (gClient.IsDoNotDisturb() ? MF_CHECKED : 0),
                     kMenuDoNotDisturb, L"暂停接收邀请");
@@ -3789,6 +4164,8 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
         ShowInfoWindow(window, InfoWindowMode::History);
       else if (LOWORD(wParam) == kMenuHelp)
         ShowInfoWindow(window, InfoWindowMode::Help);
+      else if (LOWORD(wParam) == kMenuCheckUpdate)
+        gClient.ManualUpdateCheck();
       else if (LOWORD(wParam) == kMenuDoNotDisturb)
         gClient.ToggleDoNotDisturb();
       else if (LOWORD(wParam) == kMenuTelemetry)
@@ -3800,8 +4177,16 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
       else if (LOWORD(wParam) == kMenuUnbind)
         gClient.RequestUnbind();
       return 0;
+    case plane_pet_update::kChangedMessage:
+      if (gUpdateWindow != nullptr)
+        InvalidateRect(gUpdateWindow, nullptr, FALSE);
+      return 0;
+    case plane_pet_update::kInstallMessage:
+      gClient.BeginUpdateInstall();
+      return 0;
     case WM_DESTROY:
       CloseInfoWindow();
+      CloseUpdateWindow();
       UnregisterHotKey(window, kBossHotkeyId);
       RemoveTray();
       PostQuitMessage(0);
@@ -3841,6 +4226,16 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
       static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
   infoClass.lpszClassName = kInfoWindowClassName;
   if (!RegisterClassW(&infoClass)) return 1;
+  WNDCLASSW updateClass{};
+  updateClass.style = CS_HREDRAW | CS_VREDRAW;
+  updateClass.lpfnWndProc = UpdateWindowProcedure;
+  updateClass.hInstance = instance;
+  updateClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
+  updateClass.hIcon = PlanePetIcon(GetSystemMetrics(SM_CXICON),
+                                   GetSystemMetrics(SM_CYICON));
+  updateClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+  updateClass.lpszClassName = kUpdateWindowClassName;
+  if (!RegisterClassW(&updateClass)) return 1;
   HWND window = CreateWindowExW(
       WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TOPMOST, kWindowClassName,
       L"Plane Pet PC-PC Test", WS_POPUP, 100, 100, kPetWidth, kPetHeight,
@@ -3872,13 +4267,30 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
   gClient.ShowPet();
   const bool helpOk = validInfoWindow(InfoWindowMode::Help, 700, 740);
   CloseInfoWindow();
+  ShowUpdateWindow(window, false);
+  RECT updateClient{};
+  const bool updateWindowOk =
+      gUpdateWindow != nullptr && IsWindow(gUpdateWindow) &&
+      IsWindowVisible(gUpdateWindow) &&
+      GetWindow(gUpdateWindow, GW_OWNER) == window &&
+      GetClientRect(gUpdateWindow, &updateClient) &&
+      updateClient.right - updateClient.left == kUpdateCardWidth &&
+      updateClient.bottom - updateClient.top == kUpdateCardHeight &&
+      (GetWindowLongPtrW(gUpdateWindow, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0 &&
+      (GetWindowLongPtrW(gUpdateWindow, GWL_EXSTYLE) & WS_EX_APPWINDOW) == 0;
+  CloseUpdateWindow();
   const bool coloredHeartOk = gClient.RunColoredHeartHudSelfTest();
   const bool finishedCloseOk = gClient.RunFinishedCloseSelfTest();
   const bool historyPersistenceOk = gClient.RunHistoryPersistenceSelfTest();
   gClient.Shutdown();
   DestroyWindow(window);
-  return historyOk && historyClosedWithPet && helpOk && coloredHeartOk &&
-      finishedCloseOk && historyPersistenceOk ? 0 : 3;
+  return (historyOk ? 0 : 1) |
+         (historyClosedWithPet ? 0 : 2) |
+         (helpOk ? 0 : 4) |
+         (coloredHeartOk ? 0 : 8) |
+         (finishedCloseOk ? 0 : 16) |
+         (historyPersistenceOk ? 0 : 32) |
+         (updateWindowOk ? 0 : 64);
 #endif
   RegisterHotKey(window, kBossHotkeyId,
                  MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'H');
@@ -3904,5 +4316,5 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     Sleep(1);
   }
   gClient.Shutdown();
-  return 0;
+  return gProcessExitCode;
 }

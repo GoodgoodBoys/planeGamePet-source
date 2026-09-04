@@ -30,10 +30,17 @@ bool TestAuthenticatedProtocol() {
   source.deviceId = 72;
   source.requestId = 91;
   source.pairingCode = 654321;
+  source.appVersion = {1, 2, 3};
+  source.compatibilityFlags = pcpair::PeerVersionKnown |
+                              pcpair::MajorMismatch |
+                              pcpair::LocalUpdateRequired;
   uint8_t control[pcpair::kMessageSize]{};
   pcpair::Message parsed;
   if (!pcpair::Serialize(source, control, sizeof(control), key) ||
       !pcpair::Parse(control, sizeof(control), parsed, key) ||
+      parsed.appVersion.major != 1 || parsed.appVersion.minor != 2 ||
+      parsed.appVersion.patch != 3 ||
+      parsed.compatibilityFlags != source.compatibilityFlags ||
       pcpair::Parse(control, sizeof(control), parsed, wrong)) {
     return false;
   }
@@ -68,6 +75,10 @@ struct Peer {
   uint32_t tokenHigh = 0;
   uint32_t session = 0;
   pcpair::Status status = pcpair::Status::None;
+  pcpair::AppVersion appVersion = pcpair::CurrentAppVersion();
+  pcpair::AppVersion peerAppVersion{};
+  uint8_t compatibilityFlags = 0;
+  unsigned compatibilityMessages = 0;
   bool matched = false;
   bool online = false;
   bool unbound = false;
@@ -98,6 +109,7 @@ void Close(Peer &peer) {
 void SendControl(Peer &peer, pcpair::Message message) {
   uint8_t bytes[pcpair::kMessageSize]{};
   message.deviceId = peer.deviceId;
+  message.appVersion = peer.appVersion;
   if (!pcpair::Serialize(message, bytes, sizeof(bytes))) return;
   sendto(peer.socket, reinterpret_cast<const char *>(bytes), sizeof(bytes), 0,
          reinterpret_cast<const sockaddr *>(&peer.server), sizeof(peer.server));
@@ -155,8 +167,15 @@ void Receive(Peer &peer) {
         if (control.status == pcpair::Status::Matched) {
           peer.matched = true;
           peer.bindingId = control.bindingId;
-          peer.tokenLow = control.tokenLow;
-          peer.tokenHigh = control.tokenHigh;
+          // Pairing responses carry credentials. Resume-time compatibility
+          // messages deliberately do not repeat those secrets.
+          if (control.tokenLow != 0 || control.tokenHigh != 0) {
+            peer.tokenLow = control.tokenLow;
+            peer.tokenHigh = control.tokenHigh;
+          }
+          peer.peerAppVersion = control.appVersion;
+          peer.compatibilityFlags = control.compatibilityFlags;
+          ++peer.compatibilityMessages;
         } else if (control.status == pcpair::Status::Unbound) {
           peer.unbound = true;
         }
@@ -389,6 +408,58 @@ int RunStorageError(uint16_t port, uint32_t code) {
   return rejected ? 0 : 51;
 }
 
+bool HasCompatibility(const Peer &peer, uint8_t expectedFlags,
+                      pcpair::AppVersion expectedPeer) {
+  return peer.compatibilityMessages > 0 &&
+         peer.compatibilityFlags == expectedFlags &&
+         peer.peerAppVersion.major == expectedPeer.major &&
+         peer.peerAppVersion.minor == expectedPeer.minor &&
+         peer.peerAppVersion.patch == expectedPeer.patch;
+}
+
+int RunVersionCompatibility(uint16_t port, uint32_t code) {
+  Peer older, newer;
+  older.deviceId = 13101;
+  newer.deviceId = 13102;
+  older.requestId = 14101;
+  newer.requestId = 14102;
+  older.code = newer.code = code;
+  older.appVersion = {1, 0, 0};
+  newer.appVersion = {2, 1, 3};
+  if (!Open(older, port) || !Open(newer, port)) return 70;
+
+  const bool matched = AwaitMatch(older, newer, std::chrono::seconds(3));
+  const uint8_t olderFlags = pcpair::PeerVersionKnown |
+                             pcpair::MajorMismatch |
+                             pcpair::LocalUpdateRequired;
+  const uint8_t newerFlags = pcpair::PeerVersionKnown |
+                             pcpair::MajorMismatch |
+                             pcpair::PeerUpdateRequired;
+  const bool pairingFlags = matched &&
+      HasCompatibility(older, olderFlags, newer.appVersion) &&
+      HasCompatibility(newer, newerFlags, older.appVersion);
+
+  older.compatibilityMessages = newer.compatibilityMessages = 0;
+  older.compatibilityFlags = newer.compatibilityFlags = 0;
+  older.peerAppVersion = newer.peerAppVersion = {};
+  const bool resumed = pairingFlags && AwaitResume(older, newer);
+  const bool resumeFlags = resumed &&
+      HasCompatibility(older, olderFlags, newer.appVersion) &&
+      HasCompatibility(newer, newerFlags, older.appVersion);
+  const bool unbound = resumeFlags && AwaitUnbound(older, newer);
+  Close(older);
+  Close(newer);
+  std::printf(
+      "VERSION_COMPATIBILITY matched=%u pairing_flags=%u resumed=%u "
+      "resume_flags=%u unbound=%u\n",
+      matched, pairingFlags, resumed, resumeFlags, unbound);
+  const bool success = matched && pairingFlags && resumed && resumeFlags &&
+                       unbound;
+  std::printf(success ? "PC_PET_VERSION_COMPATIBILITY_OK\n"
+                      : "PC_PET_VERSION_COMPATIBILITY_FAILED\n");
+  return success ? 0 : 71;
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -409,6 +480,8 @@ int main(int argc, char **argv) {
   if (mode == "resume") result = RunResume(port, credentials);
   else if (mode == "unbind") result = RunUnbind(port, code, credentials);
   else if (mode == "storage_error") result = RunStorageError(port, code);
+  else if (mode == "version_compatibility")
+    result = RunVersionCompatibility(port, code);
   else result = RunLifecycle(port, code, credentials);
   WSACleanup();
   return result;

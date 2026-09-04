@@ -1,6 +1,6 @@
 ﻿param(
     [string]$Archive = "",
-    [string]$ExpectedVersion = "0.6.7"
+    [string]$ExpectedVersion = "1.0.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -96,10 +96,20 @@ try {
     }
     $unicode = [Text.Encoding]::Unicode.GetString($bytes)
     foreach ($marker in @(
-            "runtime-public-$ExpectedVersion", "PlanePetPublicLauncher",
+            "runtime-public-", "PlanePetPublicLauncher",
             "PlanePetTunnel.exe", "PlanePetClient.exe")) {
         if (-not $unicode.Contains($marker)) {
             throw "Missing embedded launcher marker: $marker"
+        }
+    }
+    if (-not $unicode.Contains($ExpectedVersion)) {
+        throw "Missing embedded application version: $ExpectedVersion"
+    }
+    foreach ($marker in @(
+            "PlanePetUpdater.exe", "update-enabled",
+            "egg-ota-test.oss-cn-beijing.aliyuncs.com")) {
+        if (-not $unicode.Contains($marker)) {
+            throw "Missing embedded update marker: $marker"
         }
     }
     $instructions = Get-Content -Raw -LiteralPath $instructionsPath
@@ -112,6 +122,9 @@ try {
             throw "Instructions are missing required text: $required"
         }
     }
+    if (-not $instructions.Contains("检查软件更新")) {
+        throw "Instructions are missing the update workflow."
+    }
     $builtExe = Join-Path $root "dist\PlanePetPublic.exe"
     if (-not (Test-Path -LiteralPath $builtExe) -or
         (Get-FileHash -Algorithm SHA256 -LiteralPath $builtExe).Hash -ne
@@ -123,7 +136,7 @@ try {
     Write-Output "PUBLIC_SINGLE_STATIC_OK"
     Write-Output "archive=$Archive"
     Write-Output "sha256=$archiveHash"
-    Write-Output "pe=x64-gui icon=game-aircraft embedded=client+tunnel entries=2"
+    Write-Output "pe=x64-gui icon=game-aircraft embedded=client+tunnel+updater entries=2"
     Write-Output "signature=$($signature.Status)"
 }
 finally {

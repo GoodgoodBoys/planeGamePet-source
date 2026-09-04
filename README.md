@@ -190,7 +190,7 @@ $key
 
 ## 两台电脑公网测试版
 
-`dist\PlanePet-Public-Single-0.6.7.zip` 是两台不同 Windows 电脑使用的免配置单端测试包。
+`dist\PlanePet-Public-Single-1.0.0.zip` 是两台不同 Windows 电脑使用的免配置单端测试包。
 两位测试者分别解压并双击其中的 `PlanePet.exe`，程序会在后台启动本机 UDP→WSS
 隧道并连接：
 
@@ -230,7 +230,7 @@ ECS 使用独立的 `plane-pet.service`、`plane-pet-gateway.service` 和 Nginx 
 
 ### 单机双端公网验收包
 
-`dist\PlanePet-Public-DualLocal-0.6.7.zip` 用于只使用一台 Windows 电脑验证完整公网流程。
+`dist\PlanePet-Public-DualLocal-1.0.0.zip` 用于只使用一台 Windows 电脑验证完整公网流程。
 其中的单文件启动器会启动两个独立桌宠和两条 WSS 隧道：A 端使用本机 UDP `32110`，
 B 端使用 `32113`；两端拥有不同的设备身份、DPAPI 凭据、绑定存档、设置、战绩和
 实验事件文件，但都会连接同一个 ECS 公网入口。它不会启动或绕回本地游戏服务器。

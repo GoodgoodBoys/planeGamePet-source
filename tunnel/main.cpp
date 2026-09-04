@@ -298,7 +298,7 @@ class Tunnel {
       LogStatus("url_invalid");
       return false;
     }
-    session_ = WinHttpOpen(L"PlanePetTunnel/0.6.7",
+    session_ = WinHttpOpen(L"PlanePetTunnel/1.0.0",
                            WINHTTP_ACCESS_TYPE_NO_PROXY,
                            WINHTTP_NO_PROXY_NAME,
                            WINHTTP_NO_PROXY_BYPASS, 0);

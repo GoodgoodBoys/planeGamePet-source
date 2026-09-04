@@ -56,6 +56,7 @@ struct Binding {
   uint32_t tokenLow[2]{};
   uint32_t tokenHigh[2]{};
   uint32_t pendingRequest[2]{};
+  pcpair::AppVersion pendingVersion[2]{};
 };
 
 struct Waiter {
@@ -64,6 +65,7 @@ struct Waiter {
   uint32_t pairingCode = 0;
   sockaddr_in endpoint{};
   Clock::time_point lastSeen{};
+  pcpair::AppVersion appVersion{};
 };
 
 struct SourceRate {
@@ -85,6 +87,7 @@ struct Client {
   uint8_t input = 0;
   Clock::time_point lastSeen{};
   Clock::time_point lastEmote{};
+  pcpair::AppVersion appVersion{};
 };
 
 struct Room {
@@ -99,6 +102,11 @@ struct Room {
   uint64_t inviteId = 0;
   Clock::time_point phaseStarted{};
   Clock::time_point matchStarted{};
+};
+
+struct UnboundTombstone {
+  Binding binding{};
+  Clock::time_point expires{};
 };
 
 bool SameEndpoint(const sockaddr_in &a, const sockaddr_in &b) {
@@ -461,7 +469,53 @@ class PetServer {
     response.peerDeviceId = binding.devices[1 - slot];
     response.status = pcpair::Status::Matched;
     response.assignedSlot = static_cast<uint8_t>(slot + 1);
+    response.appVersion = binding.pendingVersion[1 - slot];
+    response.compatibilityFlags = CompatibilityFlags(
+        binding.pendingVersion[slot], binding.pendingVersion[1 - slot]);
     SendControl(endpoint, response);
+  }
+
+  static uint8_t CompatibilityFlags(const pcpair::AppVersion &local,
+                                    const pcpair::AppVersion &peer) {
+    if (!peer.Known()) return 0;
+    uint8_t flags = pcpair::PeerVersionKnown;
+    if (local.Known()) {
+      const auto localTuple =
+          std::array<uint8_t, 3>{local.major, local.minor, local.patch};
+      const auto peerTuple =
+          std::array<uint8_t, 3>{peer.major, peer.minor, peer.patch};
+      if (local.major != peer.major) flags |= pcpair::MajorMismatch;
+      if (localTuple < peerTuple)
+        flags |= pcpair::LocalUpdateRequired;
+      else if (peerTuple < localTuple)
+        flags |= pcpair::PeerUpdateRequired;
+    }
+    return flags;
+  }
+
+  void SendCompatibility(Room &room) {
+    for (size_t index = 0; index < room.clients.size(); ++index) {
+      Client &client = room.clients[index];
+      if (!client.active) continue;
+      const Client &peer = room.clients[1U - index];
+      pcpair::Message response;
+      response.type = pcpair::MessageType::Status;
+      response.deviceId = client.deviceId;
+      response.requestId = client.resumeRequestId;
+      response.bindingId = room.bindingId;
+      response.status = pcpair::Status::Matched;
+      response.assignedSlot = client.slot;
+      response.appVersion = peer.appVersion;
+      response.compatibilityFlags =
+          CompatibilityFlags(client.appVersion, peer.appVersion);
+      SendControl(client.endpoint, response);
+    }
+  }
+
+  bool MajorVersionsCompatible(const Room &room) const {
+    const pcpair::AppVersion &left = room.clients[0].appVersion;
+    const pcpair::AppVersion &right = room.clients[1].appVersion;
+    return !left.Known() || !right.Known() || left.major == right.major;
   }
 
   void RemoveWaiter(uint32_t deviceId, uint32_t requestId = 0) {
@@ -496,6 +550,7 @@ class PetServer {
           waiter.pairingCode == message.pairingCode) {
         waiter.endpoint = endpoint;
         waiter.lastSeen = Clock::now();
+        waiter.appVersion = message.appVersion;
         SendStatus(endpoint, message, pcpair::Status::Waiting);
         return;
       }
@@ -517,6 +572,7 @@ class PetServer {
       waiter.pairingCode = message.pairingCode;
       waiter.endpoint = endpoint;
       waiter.lastSeen = Clock::now();
+      waiter.appVersion = message.appVersion;
       waiters_.push_back(waiter);
       SendStatus(endpoint, message, pcpair::Status::Waiting);
       std::printf("PAIR_WAIT device=%u\n", message.deviceId);
@@ -534,6 +590,8 @@ class PetServer {
     }
     binding.pendingRequest[0] = first.requestId;
     binding.pendingRequest[1] = message.requestId;
+    binding.pendingVersion[0] = first.appVersion;
+    binding.pendingVersion[1] = message.appVersion;
     bindings_.push_back(binding);
     if (!SaveBindings()) {
       bindings_.pop_back();
@@ -605,12 +663,18 @@ class PetServer {
     }
     client.endpoint = endpoint;
     client.lastSeen = Clock::now();
+    client.appVersion = message.appVersion;
     if (binding->pendingRequest[slot] != 0) {
       const uint32_t pendingRequest = binding->pendingRequest[slot];
       binding->pendingRequest[slot] = 0;
       if (!SaveBindings()) binding->pendingRequest[slot] = pendingRequest;
     }
     SendWelcome(client);
+    if (!MajorVersionsCompatible(room) &&
+        room.phase != plink::GamePhase::Menu) {
+      EnterMenu(room, "major_version_mismatch");
+    }
+    SendCompatibility(room);
   }
 
   void HandleGoodbye(const pcpair::Message &message) {
@@ -630,7 +694,20 @@ class PetServer {
     Binding *binding = FindBinding(message.bindingId);
     const int slot =
         binding == nullptr ? -1 : BindingSlot(*binding, message.deviceId);
-    if (binding == nullptr || !ValidToken(*binding, slot, message)) {
+    if (binding == nullptr) {
+      for (const UnboundTombstone &tombstone : unboundTombstones_) {
+        const int recentSlot = BindingSlot(tombstone.binding,
+                                           message.deviceId);
+        if (tombstone.binding.id == message.bindingId &&
+            ValidToken(tombstone.binding, recentSlot, message)) {
+          SendStatus(endpoint, message, pcpair::Status::Unbound);
+          return;
+        }
+      }
+      SendStatus(endpoint, message, pcpair::Status::BindingMissing);
+      return;
+    }
+    if (!ValidToken(*binding, slot, message)) {
       SendStatus(endpoint, message, pcpair::Status::BindingMissing);
       return;
     }
@@ -664,6 +741,10 @@ class PetServer {
                          return room.bindingId == removed.id;
                        }),
         rooms_.end());
+    unboundTombstones_.push_back(
+        {removed, Clock::now() + std::chrono::seconds(30)});
+    if (unboundTombstones_.size() > 256U)
+      unboundTombstones_.erase(unboundTombstones_.begin());
     bool callerNotified = false;
     for (const NoticeTarget &target : targets) {
       pcpair::Message response;
@@ -671,7 +752,8 @@ class PetServer {
       response.deviceId = target.deviceId;
       response.bindingId = removed.id;
       response.status = pcpair::Status::Unbound;
-      SendControl(target.endpoint, response);
+      for (int repeat = 0; repeat < 3; ++repeat)
+        SendControl(target.endpoint, response);
       if (target.deviceId == message.deviceId) callerNotified = true;
     }
     if (!callerNotified)
@@ -823,6 +905,7 @@ class PetServer {
 
   void HandleAction(Room &room, Client &client, plink::PlayerAction action) {
     const auto now = Clock::now();
+    if (!MajorVersionsCompatible(room)) return;
     if (action == plink::PlayerAction::Invite &&
         room.phase == plink::GamePhase::Menu && OnlineMask(room) == 0x03U) {
       room.inviterSlot = client.slot;
@@ -944,6 +1027,12 @@ class PetServer {
         waiters_.end());
     if (before != waiters_.size())
       std::printf("PAIR_EXPIRE count=%zu\n", before - waiters_.size());
+    unboundTombstones_.erase(
+        std::remove_if(unboundTombstones_.begin(), unboundTombstones_.end(),
+                       [now](const UnboundTombstone &tombstone) {
+                         return now >= tombstone.expires;
+                       }),
+        unboundTombstones_.end());
     for (Room &room : rooms_) TickRoom(room, now);
   }
 
@@ -1073,6 +1162,7 @@ class PetServer {
   std::vector<Waiter> waiters_;
   std::vector<SourceRate> sourceRates_;
   std::vector<Room> rooms_;
+  std::vector<UnboundTombstone> unboundTombstones_;
   uint32_t serverTick_ = 0;
   uint32_t serverSequence_ = 0;
   uint64_t invalidPackets_ = 0;

@@ -8,6 +8,7 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dist = Join-Path $root "dist"
+$appVersion = "1.0.0"
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
 if (-not (Test-Path -LiteralPath $Compiler)) {
@@ -52,19 +53,21 @@ Build-One @(
 )
 
 Build-One @(
-    (Join-Path $root "desktop\main.cpp"), $desktopResourceObject,
+    (Join-Path $root "desktop\main.cpp"),
+    (Join-Path $root "desktop\update_manager.cpp"), $desktopResourceObject,
     "-o", (Join-Path $dist "PlanePetAlice.exe"),
     "-mwindows", "-lws2_32", "-lgdi32", "-lgdiplus", "-lole32",
-    "-lshell32", "-lcomdlg32", "-lbcrypt"
+    "-lshell32", "-lcomdlg32", "-lwinhttp", "-lcrypt32", "-lbcrypt"
 )
 
 # The two named binaries are kept for the one-PC demonstration.  This neutral
 # binary is the distributable client used on either of two real computers.
 Build-One @(
-    (Join-Path $root "desktop\main.cpp"), $desktopResourceObject,
+    (Join-Path $root "desktop\main.cpp"),
+    (Join-Path $root "desktop\update_manager.cpp"), $desktopResourceObject,
     "-o", (Join-Path $dist "PlanePetClient.exe"),
     "-mwindows", "-lws2_32", "-lgdi32", "-lgdiplus", "-lole32",
-    "-lshell32", "-lcomdlg32", "-lbcrypt"
+    "-lshell32", "-lcomdlg32", "-lwinhttp", "-lcrypt32", "-lbcrypt"
 )
 Copy-Item -LiteralPath (Join-Path $dist "PlanePetClient.exe") `
     -Destination (Join-Path $dist "PlanePet.exe") -Force
@@ -82,6 +85,21 @@ if ($BuildPublic) {
         (Join-Path $root "tunnel\main.cpp"),
         "-o", (Join-Path $dist "PlanePetTunnel.exe"),
         "-mwindows", "-lwinhttp", "-lws2_32", "-lcrypt32", "-lbcrypt"
+    )
+    Build-One @(
+        (Join-Path $root "updater\main.cpp"),
+        "-o", (Join-Path $dist "PlanePetUpdater.exe"),
+        "-mwindows", "-lbcrypt"
+    )
+    Build-One @(
+        (Join-Path $root "tests\update_health_stub.cpp"),
+        "-o", (Join-Path $dist "PlanePetUpdateHealthStub.exe"),
+        "-mwindows"
+    )
+    Build-One @(
+        (Join-Path $root "tests\update_unhealthy_stub.cpp"),
+        "-o", (Join-Path $dist "PlanePetUpdateUnhealthyStub.exe"),
+        "-mwindows"
     )
 }
 
@@ -108,10 +126,18 @@ Build-One @(
 )
 
 Build-One @(
-    (Join-Path $root "desktop\main.cpp"), $desktopResourceObject,
+    (Join-Path $root "tests\update_client_test.cpp"),
+    (Join-Path $root "desktop\update_manager.cpp"),
+    "-o", (Join-Path $dist "PlanePetUpdateClientTest.exe"),
+    "-lwinhttp", "-lcrypt32", "-lbcrypt"
+)
+
+Build-One @(
+    (Join-Path $root "desktop\main.cpp"),
+    (Join-Path $root "desktop\update_manager.cpp"), $desktopResourceObject,
     "-o", (Join-Path $dist "PlanePetBob.exe"),
     "-mwindows", "-lws2_32", "-lgdi32", "-lgdiplus", "-lole32",
-    "-lshell32", "-lcomdlg32", "-lbcrypt"
+    "-lshell32", "-lcomdlg32", "-lwinhttp", "-lcrypt32", "-lbcrypt"
 )
 
 $resourceObject = Join-Path $dist "PlanePetFullFlowResources.o"
@@ -150,12 +176,12 @@ if ($BuildPublic) {
         "-o", (Join-Path $dist "PlanePetPublic.exe"),
         "-mwindows"
     )
-    $publicFolder = Join-Path $dist "PlanePet-Public-Single-0.6.7"
+    $publicFolder = Join-Path $dist "PlanePet-Public-Single-$appVersion"
     New-Item -ItemType Directory -Force -Path $publicFolder | Out-Null
     Copy-Item -LiteralPath (Join-Path $dist "PlanePetPublic.exe") `
         -Destination (Join-Path $publicFolder "PlanePet.exe") -Force
     $publicInstructions = @(
-        'Plane Pet 单端公网最终测试版 v0.6.7（Windows 10/11 64 位）',
+        "Plane Pet 单端公网最终测试版 v$appVersion（Windows 10/11 64 位）",
         '',
         '1. 将这个压缩包分别发给两位测试者；每台电脑各解压并运行一份。',
         '2. 双击 PlanePet.exe，无需安装、无需配置服务器，也无需允许防火墙 UDP 入站。',
@@ -167,6 +193,7 @@ if ($BuildPublic) {
         '8. 邀请最长等待 5 分钟；对方接受后打开小型游戏窗口，最长对局 3 分钟。',
         '9. 游戏使用 WASD、方向键，或按住鼠标左键拖动飞机；结束后单击或按键返回桌宠。',
         '10. 隐藏桌宠后收到邀请会自动弹出。要彻底关闭程序，请右键飞机或托盘图标选择“退出”。',
+        '11. 程序会安全检查新版本；非必要更新可选择 7 天后提醒。也可在右键菜单选择“检查软件更新…”。大版本不兼容时，联机功能会暂停到旧版一方完成升级。',
         '',
         '联网说明：程序通过 TLS 加密连接测试服务器；匹配码只用于当次寻找正在等待的另一端。',
         '绑定存储：匹配成功后，本机和服务器保存随机设备标识及绑定令牌，用于下次自动恢复；不保存姓名，匹配码不会作为绑定凭据保存。',
@@ -177,7 +204,7 @@ if ($BuildPublic) {
     )
     Set-Content -LiteralPath (Join-Path $publicFolder "使用说明.txt") `
         -Value $publicInstructions -Encoding utf8
-    $publicPackage = Join-Path $dist "PlanePet-Public-Single-0.6.7.zip"
+    $publicPackage = Join-Path $dist "PlanePet-Public-Single-$appVersion.zip"
     Compress-Archive -Path (Join-Path $publicFolder "*") `
         -DestinationPath $publicPackage -Force
 
@@ -199,12 +226,12 @@ if ($BuildPublic) {
         "-o", (Join-Path $dist "PlanePetPublicDual.exe"),
         "-mwindows"
     )
-    $publicDualFolder = Join-Path $dist "PlanePet-Public-DualLocal-0.6.7"
+    $publicDualFolder = Join-Path $dist "PlanePet-Public-DualLocal-$appVersion"
     New-Item -ItemType Directory -Force -Path $publicDualFolder | Out-Null
     Copy-Item -LiteralPath (Join-Path $dist "PlanePetPublicDual.exe") `
         -Destination (Join-Path $publicDualFolder "PlanePet.exe") -Force
     $publicDualInstructions = @(
-        'Plane Pet 单机双端公网测试版 v0.6.7（Windows 10/11 64 位）',
+        "Plane Pet 单机双端公网测试版 v$appVersion（Windows 10/11 64 位）",
         '',
         '1. 解压后双击 PlanePet.exe；程序会打开 A端、B端两个独立桌宠。',
         '2. 两端都通过 TLS 连接公网 ECS，不会启动本地游戏服务器。',
@@ -225,7 +252,7 @@ if ($BuildPublic) {
     )
     Set-Content -LiteralPath (Join-Path $publicDualFolder "使用说明.txt") `
         -Value $publicDualInstructions -Encoding utf8
-    $publicDualPackage = Join-Path $dist "PlanePet-Public-DualLocal-0.6.7.zip"
+    $publicDualPackage = Join-Path $dist "PlanePet-Public-DualLocal-$appVersion.zip"
     Compress-Archive -Path (Join-Path $publicDualFolder "*") `
         -DestinationPath $publicDualPackage -Force
 }

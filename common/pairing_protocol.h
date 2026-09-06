@@ -18,6 +18,10 @@ constexpr size_t kMaxDatagramSize = plink::kMaxPacketSize + kAuthTagSize;
 constexpr uint32_t kWaitingTimeoutMs = 3000;
 constexpr plink::PacketType kRoundMetaPacketType =
     static_cast<plink::PacketType>(9);
+constexpr plink::PacketType kScopedActionPacketType =
+    static_cast<plink::PacketType>(10);
+constexpr plink::PacketType kActionAckPacketType =
+    static_cast<plink::PacketType>(11);
 
 struct AuthKey {
   uint64_t low = 0;
@@ -172,6 +176,7 @@ enum CompatibilityFlag : uint8_t {
   LocalUpdateRequired = 1U << 2U,
   PeerUpdateRequired = 1U << 3U,
   ServerMinimumRequired = 1U << 4U,
+  ScopedActionsSupported = 1U << 5U,
 };
 
 inline AppVersion CurrentAppVersion() {
@@ -199,6 +204,40 @@ struct RoundMeta {
   uint64_t inviteId = 0;
   plink::GamePhase phase = plink::GamePhase::Menu;
 };
+
+// Additive PC-only messages. Legacy clients keep using the original Action;
+// new clients send this only after the server advertises the capability.
+struct ScopedAction {
+  uint32_t operationId = 0;
+  plink::PlayerAction action = plink::PlayerAction::Invite;
+  RoundMeta context;
+};
+
+inline bool WriteScopedAction(plink::PacketWriter &writer,
+                              const ScopedAction &value) {
+  return writer.U32(value.operationId) &&
+         writer.U8(static_cast<uint8_t>(value.action)) &&
+         writer.U32(static_cast<uint32_t>(value.context.roundId)) &&
+         writer.U32(static_cast<uint32_t>(value.context.roundId >> 32U)) &&
+         writer.U32(static_cast<uint32_t>(value.context.inviteId)) &&
+         writer.U32(static_cast<uint32_t>(value.context.inviteId >> 32U)) &&
+         writer.U8(static_cast<uint8_t>(value.context.phase));
+}
+
+inline bool ReadScopedAction(plink::PayloadReader &reader, ScopedAction &value) {
+  uint8_t action = 0, phase = 0;
+  uint32_t rl = 0, rh = 0, il = 0, ih = 0;
+  if (!reader.U32(value.operationId) || !reader.U8(action) ||
+      !reader.U32(rl) || !reader.U32(rh) || !reader.U32(il) ||
+      !reader.U32(ih) || !reader.U8(phase) || !reader.Done() ||
+      value.operationId == 0 || action < 1 || action > 3 ||
+      phase > static_cast<uint8_t>(plink::GamePhase::Finished)) return false;
+  value.action = static_cast<plink::PlayerAction>(action);
+  value.context = {static_cast<uint64_t>(rl) | (static_cast<uint64_t>(rh) << 32U),
+                   static_cast<uint64_t>(il) | (static_cast<uint64_t>(ih) << 32U),
+                   static_cast<plink::GamePhase>(phase)};
+  return true;
+}
 
 inline bool WriteRoundMeta(plink::PacketWriter &writer,
                            const RoundMeta &value) {

@@ -18,7 +18,8 @@ Environment=PLANE_PET_TELEMETRY_RETENTION_DAYS=90
 Environment=PLANE_PET_ADMIN_PASSWORD_FILE=/etc/plane-pet/gateway-admin.password
 Environment=PLANE_PET_MAX_CONNECTIONS=128
 Environment=PLANE_PET_MAX_ENROLLMENTS=1000
-Environment=PLANE_PET_MAX_ENROLLMENTS_PER_IP=8
+# Rolling one-hour registration budget; not a lifetime device count.
+Environment=PLANE_PET_MAX_ENROLLMENTS_PER_IP=64
 ExecStart=/usr/bin/python3 /opt/plane-pet/gateway/plane_pet_gateway.py
 Restart=on-failure
 RestartSec=2

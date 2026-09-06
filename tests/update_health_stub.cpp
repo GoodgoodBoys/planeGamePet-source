@@ -32,6 +32,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
       data = std::filesystem::path(module).parent_path() / L"data";
     }
   }
+  if (Option(L"update-failed") == L"1" && !data.empty()) {
+    std::ofstream marker(data / L"old-version-restarted");
+    marker << "restarted";
+  }
   if (token.empty() || data.empty()) return 0;
   std::wofstream output(data / L"update.health", std::ios::trunc);
   output << token << L'\n';

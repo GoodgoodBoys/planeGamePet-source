@@ -29,6 +29,9 @@
 #include "../common/pairing_protocol.h"
 #include "../common/app_version.h"
 #include "update_manager.h"
+#ifdef PLANE_PET_UPDATE_WINDOW_SELF_TEST
+#include "../tests/update_test_access.h"
+#endif
 #include "game_layout.h"
 #include "../shared/plane_protocol.h"
 #include "../shared/plane_sim.h"
@@ -38,6 +41,7 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 constexpr UINT kTrayMessage = WM_APP + 1;
+constexpr UINT_PTR kNetworkPumpTimer = 71;
 constexpr UINT kEmergencyHideMessage = WM_APP + 2;
 constexpr UINT kMenuShow = 2001;
 constexpr UINT kMenuHide = 2002;
@@ -83,8 +87,28 @@ constexpr int kUpdateInstallExitCode = 73;
 
 void ShowUpdateWindow(HWND owner, bool activate);
 void CloseUpdateWindow();
-void RepositionUpdateWindow(HWND owner);
+bool RepositionUpdateWindow(HWND owner);
+bool RefreshUpdateWindowContent(uint64_t generation, uint32_t progress);
+void RefreshHistoryInfoWindow();
 int gProcessExitCode = 0;
+unsigned gModalDepth = 0;
+struct ModalScope {
+  ModalScope() { ++gModalDepth; }
+  ~ModalScope() { --gModalDepth; }
+};
+int PetMessageBoxW(HWND owner, LPCWSTR text, LPCWSTR title, UINT type) {
+  ModalScope scope;
+  return ::MessageBoxW(owner, text, title, type);
+}
+BOOL PetTrackPopupMenu(HMENU menu, UINT flags, int x, int y, int reserved,
+                    HWND owner, const RECT *rect) {
+  ModalScope scope;
+  return ::TrackPopupMenu(menu, flags, x, y, reserved, owner, rect);
+}
+BOOL PetGetSaveFileNameW(LPOPENFILENAMEW dialog) {
+  ModalScope scope;
+  return ::GetSaveFileNameW(dialog);
+}
 
 class GdiPlusSession {
  public:
@@ -221,7 +245,7 @@ class PetClient {
     const bool defaultBob = DefaultBobInstance();
     serverText_ = Option("server", "127.0.0.1:32110");
     if (!pcpair::ParseAuthKey(Option("network-key", ""), networkKey_)) {
-      MessageBoxW(window_,
+      PetMessageBoxW(window_,
                   L"网络密钥格式无效：应为 32 个十六进制字符。",
                   L"Plane Pet", MB_OK | MB_ICONERROR);
       return false;
@@ -258,9 +282,9 @@ class PetClient {
       if (telemetryUploadCapable_) {
         telemetryUploadChoice_ = telemetryEnabled_ ? 1 : 0;
       }
-      SaveSettings();
+      PersistTelemetryPreference(telemetryEnabled_);
     } else if (telemetryUploadCapable_ && telemetryUploadChoice_ < 0) {
-      const int consent = MessageBoxW(
+      const int consent = PetMessageBoxW(
           window_,
           L"是否允许记录并发送匿名使用统计？\n\n"
           L"记录启动与使用时长、匹配和好友在线状态变化、邀请响应、桌宠显示/隐藏与勿扰状态、四种固定表情的发送/接收类型，以及对局过程和结果；不会记录聊天文字、匹配码、姓名、按键、鼠标轨迹、屏幕内容或窗口标题。\n\n"
@@ -269,9 +293,9 @@ class PetClient {
       telemetryUploadChoice_ = consent == IDYES ? 1 : 0;
       telemetryEnabled_ = consent == IDYES;
       telemetryChoiceKnown_ = true;
-      SaveSettings();
+      PersistTelemetryPreference(telemetryEnabled_);
     } else if (!telemetryChoiceKnown_) {
-      const int consent = MessageBoxW(
+      const int consent = PetMessageBoxW(
           window_,
           L"是否允许在本机记录匿名实验事件？\n\n"
           L"仅在本机记录启动与使用时长、匹配和好友在线状态变化、邀请响应、桌宠显示/隐藏与勿扰状态、四种固定表情的发送/接收类型，以及对局过程和结果；不会记录聊天文字、匹配码、姓名、按键、鼠标轨迹、屏幕内容或窗口标题，也不会自动上传。\n\n"
@@ -279,7 +303,7 @@ class PetClient {
           L"Plane Pet - 本地实验数据", MB_YESNO | MB_ICONINFORMATION);
       telemetryEnabled_ = consent == IDYES;
       telemetryChoiceKnown_ = true;
-      SaveSettings();
+      PersistTelemetryPreference(telemetryEnabled_);
     }
     const std::wstring configuredEvents = Wide(Option("events", ""));
     if (configuredEvents.empty()) {
@@ -289,6 +313,16 @@ class PetClient {
       eventsPath_ = std::filesystem::path(configuredEvents);
     }
     LoadState();
+    if (bindingId_ == 0) {
+      std::ifstream journal(std::filesystem::path(statePath_.wstring() + L".pairing"));
+      uint32_t request = 0;
+      if (journal >> request && request != 0) {
+        pairingRequestId_ = request;
+        pairingCancelPending_ = true;
+      }
+    } else {
+      DeleteFileW((statePath_.wstring() + L".pairing").c_str());
+    }
     historyPath_ = statePath_.parent_path() /
                    (statePath_.stem().wstring() + L".history");
     LoadHistory();
@@ -314,7 +348,7 @@ class PetClient {
       awaitingPairing_ = false;
       pairingAttempted_ = false;
       pairingCode_ = 0;
-    } else if (startupPairingCode == 0 || !statePersistenceOk_) {
+    } else if (startupPairingCode == 0 || !statePersistenceOk_ || pairingCancelPending_) {
       awaitingPairing_ = true;
       pairingCode_ = 0;
       if (!statePersistenceOk_)
@@ -336,13 +370,28 @@ class PetClient {
     u_long enabled = 1;
     ioctlsocket(socket_, FIONBIO, &enabled);
     if (!ResolveServer()) return false;
+    BeginUsageSegment();
     LogEvent("app_started", bindingId_ != 0 ? 1 : 0);
     if (atoi(Option("update-installed", "0").c_str()) != 0)
       LogEvent("update_install_succeeded");
     if (atoi(Option("update-rollback", "0").c_str()) != 0)
       LogEvent("update_rollback");
-    if (atoi(Option("update-failed", "0").c_str()) != 0)
+    const auto failurePath = updateRequestPath_.parent_path() / L"update.failure";
+    std::ifstream failureFile(failurePath, std::ios::binary);
+    std::string failureReason;
+    std::getline(failureFile, failureReason);
+    failureFile.close();
+    if (!failureReason.empty() || atoi(Option("update-failed", "0").c_str()) != 0) {
       LogEvent("update_install_failed");
+      updateManager_.ReportInstallFailure(failureReason.empty()
+          ? L"升级未完成，已重新打开当前版本，请重新检查更新。"
+          : Wide(failureReason.substr(0, 1024)));
+      // Keep a readable last-failure record without replaying the event on
+      // every subsequent ordinary startup.
+      MoveFileExW(failurePath.c_str(),
+          (updateRequestPath_.parent_path() / L"update.failure.seen").c_str(),
+          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    }
     ResetPrediction();
     nextPairing_ = nextInput_ = nextPing_ = nextPrediction_ = Clock::now();
     nextTelemetryHeartbeat_ = Clock::now() + std::chrono::seconds(60);
@@ -352,9 +401,10 @@ class PetClient {
 
   void Shutdown() {
     RecordAbandonedMatch();
-    LogEvent("app_exited", MillisSince(start_));
+    EndUsageSegment();
+    LogEvent("app_exited", telemetryActiveMillis_);
     if (socket_ != INVALID_SOCKET) {
-      if (pairingAttempted_) {
+      if (pairingAttempted_ || pairingCancelPending_) {
         for (int i = 0; i < 3; ++i) SendPairCancel();
       }
       if (bindingId_ != 0) {
@@ -367,35 +417,54 @@ class PetClient {
   }
 
   void Update() {
+    if (updating_) return;
+    updating_ = true;
+    struct UpdateGuard { bool &active; ~UpdateGuard() { active = false; } } guard{updating_};
     ReceiveAll();
     const auto now = Clock::now();
-    updateManager_.Tick(!gameMode_, peerVersionDiffers_,
-                        localUpdateRequired_, majorVersionMismatch_);
+    const bool updateUiAvailable = IsUpdateUiAvailable();
+    updateManager_.Tick(updateUiAvailable, peerVersionDiffers_,
+                        localUpdateRequired_, majorVersionMismatch_,
+                        (static_cast<uint32_t>(peerAppVersion_.major) << 16U) |
+                        (static_cast<uint32_t>(peerAppVersion_.minor) << 8U) |
+                        peerAppVersion_.patch);
     const auto update = updateManager_.GetSnapshot();
     if (update.generation != lastUpdateGeneration_) {
       lastUpdateGeneration_ = update.generation;
-      if (update.state == plane_pet_update::State::Checking)
+      const bool stateChanged = update.state != lastUpdateState_;
+      lastUpdateState_ = update.state;
+      if (stateChanged && update.state == plane_pet_update::State::Checking)
         LogEvent("update_check", update.manual ? 1 : 0);
-      else if (update.state == plane_pet_update::State::Downloading)
+      else if (stateChanged && update.state == plane_pet_update::State::Downloading)
         LogEvent("update_download_started", update.required ? 1 : 0);
-      else if (update.state == plane_pet_update::State::Error)
+      else if (stateChanged && update.state == plane_pet_update::State::Error)
         LogEvent("update_verify_failed");
-      const bool important = update.required;
-      const bool shouldShow = update.manual || important ||
-          (!hiddenByUser_ && update.state == plane_pet_update::State::Available);
-      const bool informative = update.manual &&
-          (update.state == plane_pet_update::State::Checking ||
-           update.state == plane_pet_update::State::Current ||
-           update.state == plane_pet_update::State::Error);
-      if (!gameMode_ && (shouldShow || informative)) {
-        if (important && hiddenByUser_) ShowPet();
+      else if (stateChanged &&
+               (update.state == plane_pet_update::State::Available ||
+                update.state == plane_pet_update::State::Required))
+        LogEvent("update_available", update.required ? 1 : 0);
+    }
+    // Keep pending results until idle; consuming their generation during a
+    // game used to lose the prompt forever when returning to the pet.
+    if (updateUiAvailable &&
+        update.generation != lastUpdatePromptGeneration_) {
+      lastUpdatePromptGeneration_ = update.generation;
+      if (plane_pet_update::ShouldShowPrompt(update, !hiddenByUser_)) {
+        if ((update.required || update.manual) && hiddenByUser_) ShowPet();
         ShowUpdateWindow(window_, update.manual);
-        if (update.state == plane_pet_update::State::Available ||
-            update.state == plane_pet_update::State::Required)
-          LogEvent("update_available", update.required ? 1 : 0);
       }
     }
-    if (!gameMode_) RepositionUpdateWindow(window_);
+    if (updateUiAvailable) {
+      if (updateManager_.HasInstallRequest()) {
+        BeginUpdateInstall();
+        return;
+      }
+      RepositionUpdateWindow(window_);
+      RefreshUpdateWindowContent(update.generation, update.progressPercent);
+    } else {
+      lastUpdatePromptGeneration_ = 0;
+      CloseUpdateWindow();
+    }
     if (!inviteFeedback_.empty() && now >= inviteFeedbackUntil_) {
       inviteFeedback_.clear();
       inviteFeedbackUntil_ = Clock::time_point{};
@@ -404,9 +473,13 @@ class PetClient {
     if (telemetryEnabled_ && now >= nextTelemetryHeartbeat_) {
       const int64_t state = gameMode_ ? 2 : (hiddenByUser_ ? 1 : 0);
       LogEvent("session_heartbeat", state);
+      LogEvent("usage_heartbeat", EnabledUsageMillis());
       nextTelemetryHeartbeat_ = now + std::chrono::seconds(60);
     }
-    if (unbindPending_ && now >= nextUnbind_) {
+    if (pairingCancelPending_ && now >= nextPairing_) {
+      SendPairCancel();
+      nextPairing_ = now + std::chrono::milliseconds(500);
+    } else if (unbindPending_ && now >= nextUnbind_) {
       SendUnbind();
       nextUnbind_ = now + std::chrono::milliseconds(500);
     } else if (pairingAttempted_ && now >= nextPairing_) {
@@ -426,16 +499,21 @@ class PetClient {
       nextPing_ = now + std::chrono::seconds(1);
     }
     if (pendingAction_ != 0 && session_ != 0 && now >= nextAction_) {
-      SendAction(static_cast<plink::PlayerAction>(pendingAction_));
+      if (Phase() != pendingActionContext_.phase ||
+          now - pendingActionStarted_ > std::chrono::seconds(5)) {
+        pendingAction_ = 0;
+      } else {
+        SendPendingAction();
+      }
       nextAction_ = now + std::chrono::milliseconds(250);
     }
-    if (autoInvite_ && !autoInviteSent_ && session_ != 0 &&
-        Phase() == plink::GamePhase::Menu && OpponentOnline()) {
+    if (autoInvite_ && !autoInviteSent_ && CanInvite()) {
       autoInviteSent_ = true;
       InviteFromMenu();
     }
     if (autoAccept_ && !autoAcceptSent_ && session_ != 0 &&
-        IsIncomingInvite()) {
+        IsIncomingInvite() &&
+        (!scopedActionsSupported_ || (haveRoundMeta_ && roundMetaPhase_ == Phase()))) {
       autoAcceptSent_ = true;
       LogEvent("invite_accepted", ElapsedMillis(incomingInviteAt_));
       QueueAction(plink::PlayerAction::Accept);
@@ -591,7 +669,7 @@ class PetClient {
       y += 38 + bodyHeight;
     };
     section(L"1 · 初次绑定",
-            L"绑定电脑框默认显示；想只看飞机动画，可在右键菜单取消勾选“显示绑定电脑框”，再次勾选即可恢复。输入框和信息卡可按住左键拖动；搜索中可按 Esc 或右键停止。两端输入相同六位码并按 Enter，成功后下次会自动上线。", 92);
+            L"绑定电脑框默认显示，可右键勾选显示或关闭。输入框和信息卡可按住左键拖动。两端输入相同六位码并按 Enter；搜索中按 Esc 停止，待服务器确认后可重试。双方存档完成后永久绑定，重启自动上线。", 92);
     section(L"2 · 桌宠与在线状态",
             L"飞机左上角绿点表示对方在线，红点表示离线。像素云向机尾掠过；对方在线时红机会变向逃跑，蓝机切弯追击射击（仅为动画，无伤害）。按住飞机可拖动。", 58);
     section(L"3 · 快捷表情",
@@ -611,7 +689,7 @@ class PetClient {
     section(L"10 · 隐私与本地数据",
             L"同意后会记录启动和使用时长、匹配及在线状态变化、邀请响应、显示/隐藏与勿扰状态、四种表情类型和对局过程/结果。不记录聊天文字、匹配码、姓名、键鼠轨迹、屏幕内容或窗口标题；服务器原始事件最长保留 90 天。即使关闭统计，联网必需的匿名绑定和鉴权凭据仍会保存。", 114);
     section(L"11 · 软件更新",
-            L"右键选择“检查软件更新…”可随时手动检查。非必要更新可选择 7 天后提醒；双方大版本不同时，联机邀请会暂停，旧版一方需升级。下载包和更新清单都会经过校验，启动失败会自动还原旧版。", 76);
+            L"右键“检查软件更新…”可手动检查；×、Esc 或“关闭”均可关闭提示。非必要更新可 7 天后提醒；双方大版本不同时旧版需升级后联机。下载中可取消，完成后待机安装；失败会保留或还原旧版，并显示原因。", 100);
   }
 
   void OnLeftButtonDown(int x, int y) {
@@ -644,7 +722,7 @@ class PetClient {
       return;
     }
     const POINT point{x, y};
-    for (int index = 0; index < 4; ++index) {
+    for (int index = 0; Phase() == plink::GamePhase::Menu && index < 4; ++index) {
       const RECT button = QuickEmoteRect(index);
       if (PtInRect(&button, point)) {
         if (Phase() == plink::GamePhase::Menu) SendQuickEmote(index);
@@ -780,6 +858,7 @@ class PetClient {
   void HideByUser() {
     CloseInfoWindow();
     CloseUpdateWindow();
+    updateManager_.Dismiss();
     if (gameMode_) {
       EmergencyHide();
       return;
@@ -811,6 +890,7 @@ class PetClient {
   void EmergencyHide() {
     CloseInfoWindow();
     CloseUpdateWindow();
+    updateManager_.Dismiss();
     const bool hidingGame = gameMode_;
     mouseDragging_ = false;
     currentInput_ = 0;
@@ -838,7 +918,7 @@ class PetClient {
   void TogglePairingPanel() {
     if (!NeedsPairing()) return;
     pairingPanelVisible_ = !pairingPanelVisible_;
-    SaveSettings();
+    SaveSettingsOrNotify();
     InvalidateRect(window_, nullptr, FALSE);
   }
   bool HasBinding() const { return bindingId_ != 0; }
@@ -850,18 +930,33 @@ class PetClient {
   }
   bool UpdatesEnabled() const { return updateManager_.Enabled(); }
   bool IsPetHidden() const { return hiddenByUser_; }
+  bool IsUpdateUiAvailable() const {
+    return gModalDepth == 0 && !gameMode_ && !pairingAttempted_ &&
+           Phase() == plink::GamePhase::Menu && pendingAction_ == 0;
+  }
   plane_pet_update::Snapshot UpdateSnapshot() const {
     return updateManager_.GetSnapshot();
   }
+#ifdef PLANE_PET_UPDATE_WINDOW_SELF_TEST
+  plane_pet_update::Manager &UpdateManagerForTest() { return updateManager_; }
+  void SetUpdateTestGamePhase(plink::GamePhase phase) {
+    haveSnapshot_ = true;
+    snapshot_.phase = phase;
+    gameMode_ = phase != plink::GamePhase::Menu;
+  }
+#endif
   void ManualUpdateCheck() {
     if (!updateManager_.Enabled()) return;
-    updateManager_.CheckNow();
-    ShowUpdateWindow(window_, true);
+    updateManager_.CheckNow(majorVersionMismatch_ && localUpdateRequired_);
+    if (IsUpdateUiAvailable()) {
+      if (hiddenByUser_) ShowPet();
+      ShowUpdateWindow(window_, true);
+    }
   }
   void AcceptUpdate() {
     const auto state = updateManager_.GetSnapshot();
-    LogEvent("update_accepted", state.required ? 1 : 0);
-    updateManager_.AcceptAndDownload();
+    if (IsUpdateUiAvailable() && updateManager_.AcceptAndDownload())
+      LogEvent("update_accepted", state.required ? 1 : 0);
   }
   void DeclineOrDismissUpdate() {
     const auto state = updateManager_.GetSnapshot();
@@ -869,7 +964,7 @@ class PetClient {
       updateSnoozeUntilMs_ =
           UnixTimeMillis() + 7ULL * 24ULL * 60ULL * 60ULL * 1000ULL;
       updateManager_.SetOptionalSnoozeUntil(updateSnoozeUntilMs_);
-      SaveSettings();
+      SaveSettingsOrNotify();
       LogEvent("update_declined", 7);
     } else {
       updateManager_.Dismiss();
@@ -877,7 +972,7 @@ class PetClient {
     CloseUpdateWindow();
   }
   void BeginUpdateInstall() {
-    if (!updateManager_.HasInstallRequest()) return;
+    if (!IsUpdateUiAvailable() || !updateManager_.HasInstallRequest()) return;
     LogEvent("update_download_completed");
     LogEvent("update_install_started");
     gProcessExitCode = kUpdateInstallExitCode;
@@ -885,37 +980,40 @@ class PetClient {
   }
   void ToggleTelemetry() {
     if (IsTelemetryEnabled()) {
-      telemetryEnabled_ = false;
-      if (telemetryUploadCapable_) telemetryUploadChoice_ = 0;
-      telemetryChoiceKnown_ = true;
-      SaveSettings();
-      MessageBoxW(window_, L"已停止后续匿名统计与本地实验事件记录。",
-                  L"匿名统计", MB_OK | MB_ICONINFORMATION);
+      EndUsageSegment();
+      const bool saved = PersistTelemetryPreference(false);
+      PetMessageBoxW(window_, saved
+          ? L"已停止后续匿名统计与本地实验事件记录。"
+          : L"本次运行已停止统计，但无法保存关闭设置。\n请解除文件占用或检查磁盘后再次关闭；重启前请确认保存成功。",
+          L"匿名统计", MB_OK | (saved ? MB_ICONINFORMATION : MB_ICONWARNING));
       return;
     }
     if (telemetryUploadCapable_) {
-      const int consent = MessageBoxW(
+      const int consent = PetMessageBoxW(
           window_,
           L"开启后会通过加密连接发送启动与使用时长、匹配和好友在线状态变化、邀请响应、桌宠显示/隐藏与勿扰状态、四种固定表情的发送/接收类型，以及对局过程和结果。\n\n不会记录聊天文字、匹配码、姓名、键鼠轨迹、屏幕内容或窗口标题。原始匿名事件最长保留 90 天。",
           L"开启匿名统计", MB_YESNO | MB_ICONINFORMATION);
       if (consent != IDYES) return;
-      telemetryUploadChoice_ = 1;
     }
-    telemetryEnabled_ = true;
-    telemetryChoiceKnown_ = true;
+    if (!PersistTelemetryPreference(true)) {
+      PetMessageBoxW(window_, L"无法保存统计设置，本次未开启统计。请检查存档权限或文件占用。",
+                  L"匿名统计", MB_OK | MB_ICONWARNING);
+      return;
+    }
+    BeginUsageSegment();
     nextTelemetryHeartbeat_ = Clock::now() + std::chrono::seconds(60);
-    SaveSettings();
     LogEvent("session_heartbeat", gameMode_ ? 2 : (hiddenByUser_ ? 1 : 0));
   }
   bool CanInvite() const {
     return !gameMode_ && !awaitingPairing_ && !pairingAttempted_ &&
+           !pairingCancelPending_ && pendingAction_ == 0 &&
+           (!scopedActionsSupported_ || (haveRoundMeta_ && roundMetaPhase_ == Phase())) &&
            session_ != 0 && Phase() == plink::GamePhase::Menu &&
            OpponentOnline() && !majorVersionMismatch_;
   }
   bool CanSendQuickEmote() const { return CanInvite(); }
   void InviteFromMenu() {
     if (!CanInvite()) return;
-    currentInviteId_ = 0;
     inviteFeedback_.clear();
     inviteFeedbackUntil_ = Clock::time_point{};
     outgoingInviteAt_ = Clock::now();
@@ -925,27 +1023,47 @@ class PetClient {
   void StopPairingFromMenu() { StopPairing(); }
   void ToggleDoNotDisturb() {
     doNotDisturb_ = !doNotDisturb_;
-    SaveSettings();
+    SaveSettingsOrNotify();
     LogEvent(doNotDisturb_ ? "dnd_enabled" : "dnd_disabled");
     InvalidateRect(window_, nullptr, FALSE);
   }
   void ClearLocalData() {
-    const int choice = MessageBoxW(
+    const int choice = PetMessageBoxW(
         window_,
         L"确定清除本机的历史战绩和匿名实验事件吗？\n\n绑定关系、设置和服务器已收到的匿名统计不会被删除。",
         L"清除本地数据", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
     if (choice != IDYES) return;
+    const bool cleared = ClearLocalDataFiles();
+    RefreshHistoryInfoWindow();
+    PetMessageBoxW(window_, cleared ? L"本机战绩与实验事件已清除。"
+        : L"部分本地数据未能清除。请解除文件占用或检查存档权限后重试。\n未能保存的战绩已在界面中保留。",
+        L"Plane Pet", MB_OK | (cleared ? MB_ICONINFORMATION : MB_ICONWARNING));
+  }
+
+  bool ClearLocalDataFiles() {
+    const auto recent = recentHistory_;
+    const auto total = historyTotal_, wins = historyWins_, losses = historyLosses_, draws = historyDraws_;
+    const auto lastRound = lastRecordedRoundId_;
     ResetHistory();
     historyPersistenceOk_ = SaveHistory();
-    std::error_code error;
-    std::filesystem::remove(eventsPath_, error);
-    std::filesystem::remove(eventsPath_.wstring() + L".legacy", error);
-    MessageBoxW(window_, L"本机战绩与实验事件已清除。", L"Plane Pet",
-                MB_OK | MB_ICONINFORMATION);
+    if (!historyPersistenceOk_) {
+      recentHistory_ = recent;
+      historyTotal_ = total; historyWins_ = wins; historyLosses_ = losses; historyDraws_ = draws;
+      lastRecordedRoundId_ = lastRound;
+    }
+    bool removed = true;
+    if (!eventsPath_.empty()) {
+      for (const auto &path : {eventsPath_, std::filesystem::path(eventsPath_.wstring() + L".legacy")}) {
+        std::error_code error;
+        std::filesystem::remove(path, error);
+        removed = removed && !error;
+      }
+    }
+    return historyPersistenceOk_ && removed;
   }
   void ExportLocalData() {
     if (eventsPath_.empty() || !std::filesystem::exists(eventsPath_)) {
-      MessageBoxW(window_,
+      PetMessageBoxW(window_,
                   L"当前没有可导出的匿名实验事件。\n如已关闭实验记录，可在下次启动时通过 --telemetry=1 启用。",
                   L"导出实验数据", MB_OK | MB_ICONINFORMATION);
       return;
@@ -962,18 +1080,18 @@ class PetClient {
     dialog.lpstrDefExt = L"csv";
     dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST |
                    OFN_NOCHANGEDIR;
-    if (!GetSaveFileNameW(&dialog)) return;
+    if (!PetGetSaveFileNameW(&dialog)) return;
     if (CopyFileW(eventsPath_.c_str(), target, FALSE) == FALSE) {
-      MessageBoxW(window_, L"导出失败，请检查目标目录权限。",
+      PetMessageBoxW(window_, L"导出失败，请检查目标目录权限。",
                   L"导出实验数据", MB_OK | MB_ICONERROR);
       return;
     }
-    MessageBoxW(window_, L"匿名实验事件已导出。", L"导出实验数据",
+    PetMessageBoxW(window_, L"匿名实验事件已导出。", L"导出实验数据",
                 MB_OK | MB_ICONINFORMATION);
   }
   void RequestUnbind() {
     if (bindingId_ == 0 || unbindPending_) return;
-    const int choice = MessageBoxW(
+    const int choice = PetMessageBoxW(
         window_,
         L"确定解除当前电脑绑定吗？\n\n双方都会回到匹配码输入界面；本机历史战绩会保留。",
         L"解除绑定", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2);
@@ -1415,7 +1533,81 @@ class PetClient {
     SendTelemetryEvent(event, value);
   }
 
+  int64_t EnabledUsageMillis() const {
+    return telemetryActiveMillis_ + (telemetrySegmentOpen_ ? ElapsedMillis(telemetryActiveSince_) : 0);
+  }
+
+  void BeginUsageSegment() {
+    if (!telemetryEnabled_ || telemetrySegmentOpen_) return;
+    telemetryActiveSince_ = Clock::now();
+    telemetrySegmentOpen_ = true;
+    LogEvent("usage_started", telemetryActiveMillis_);
+  }
+
+  void EndUsageSegment() {
+    if (!telemetrySegmentOpen_) return;
+    telemetryActiveMillis_ = EnabledUsageMillis();
+    telemetrySegmentOpen_ = false;
+    LogEvent("usage_ended", telemetryActiveMillis_);
+  }
+
+  bool WriteTelemetryOffMarker() const {
+    const std::filesystem::path path = settingsPath_.wstring() + L".telemetry-off";
+    std::error_code error;
+    std::filesystem::create_directories(path.parent_path(), error);
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    const char bytes[] = "disabled\n";
+    DWORD written = 0;
+    const bool ok = WriteFile(file, bytes, sizeof(bytes) - 1, &written, nullptr) &&
+                    written == sizeof(bytes) - 1 && FlushFileBuffers(file);
+    CloseHandle(file);
+    return ok;
+  }
+
+  bool PersistTelemetryPreference(bool enabled) {
+    telemetryEnabled_ = enabled;
+    telemetryChoiceKnown_ = true;
+    if (telemetryUploadCapable_) telemetryUploadChoice_ = enabled ? 1 : 0;
+    if (!enabled) {
+      const bool marked = WriteTelemetryOffMarker();
+      return SaveSettings() || marked;
+    }
+    if (SaveSettings()) {
+      const auto marker = settingsPath_.wstring() + L".telemetry-off";
+      if (DeleteFileW(marker.c_str()) || GetLastError() == ERROR_FILE_NOT_FOUND) return true;
+    }
+    // Never enable recording when its persistent consent state is uncertain.
+    telemetryEnabled_ = false;
+    if (telemetryUploadCapable_) telemetryUploadChoice_ = 0;
+    WriteTelemetryOffMarker();
+    SaveSettings();
+    connectionNotice_ = L"统计未开启\n无法保存设置";
+    connectionNoticeUntil_ = Clock::now() + std::chrono::seconds(15);
+    return false;
+  }
+
+  void SaveSettingsOrNotify() {
+    if (SaveSettings()) return;
+    connectionNotice_ = L"设置仅本次生效\n无法保存，请重试";
+    connectionNoticeUntil_ = Clock::now() + std::chrono::seconds(15);
+  }
+
   void LoadSettings() {
+    ReadSettingsFile();
+    const auto marker = settingsPath_.wstring() + L".telemetry-off";
+    const DWORD attributes = GetFileAttributesW(marker.c_str());
+    const DWORD error = GetLastError();
+    if (attributes != INVALID_FILE_ATTRIBUTES ||
+        (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)) {
+      telemetryEnabled_ = false;
+      telemetryUploadChoice_ = 0;
+      telemetryChoiceKnown_ = true;
+    }
+  }
+
+  void ReadSettingsFile() {
     std::ifstream input(settingsPath_);
     std::string magic;
     uint32_t version = 0;
@@ -1723,11 +1915,33 @@ class PetClient {
     currentInviteId_ = 0;
     historyRecordedForRound_ = false;
     unbindPending_ = false;
+    unbindRequestId_ = 0;
+    resumeRequestId_ = SecureRandomU32();
+    scopedActionsSupported_ = false;
+    haveRoundMeta_ = false;
+    pendingAction_ = 0;
   }
 
   void BeginPairing(uint32_t code) {
+    if (pairingCancelPending_) {
+      pairingError_ = L"正在确认停止上次匹配，请稍候";
+      return;
+    }
     pairingCode_ = code;
     pairingRequestId_ = SecureRandomU32();
+    const std::filesystem::path journal = statePath_.wstring() + L".pairing";
+    const std::filesystem::path temporary = journal.wstring() + L".tmp";
+    std::ofstream output(temporary, std::ios::trunc);
+    output << pairingRequestId_ << '\n';
+    output.close();
+    if (!output || !MoveFileExW(temporary.c_str(), journal.c_str(),
+                                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+      pairingError_ = L"无法保存匹配请求，请检查目录权限";
+      pairingRequestId_ = 0;
+      pairingCode_ = 0;
+      awaitingPairing_ = true;
+      return;
+    }
     pairingAttempted_ = true;
     awaitingPairing_ = false;
     serverConfirmedWaiting_ = false;
@@ -1744,12 +1958,13 @@ class PetClient {
     if (!pairingAttempted_) return;
     for (int i = 0; i < 3; ++i) SendPairCancel();
     pairingAttempted_ = false;
+    pairingCancelPending_ = true;
+    lastCancelledRequest_ = pairingRequestId_;
     awaitingPairing_ = true;
     serverConfirmedWaiting_ = false;
     pairingCode_ = 0;
-    pairingRequestId_ = 0;
     pairingInput_.clear();
-    pairingError_ = L"已停止匹配，可以重新输入";
+    pairingError_ = L"正在确认停止匹配，请稍候";
     LogEvent("pairing_stopped", ElapsedMillis(pairingSubmittedAt_));
     SetPetMode(true);
     InvalidateRect(window_, nullptr, FALSE);
@@ -1836,6 +2051,8 @@ class PetClient {
     if (bindingId_ == 0) return;
     pcpair::Message message;
     message.type = pcpair::MessageType::Unbind;
+    if (unbindRequestId_ == 0) unbindRequestId_ = SecureRandomU32();
+    message.requestId = unbindRequestId_;
     message.bindingId = bindingId_;
     message.tokenLow = tokenLow_;
     message.tokenHigh = tokenHigh_;
@@ -1906,8 +2123,39 @@ class PetClient {
   }
 
   void QueueAction(plink::PlayerAction action) {
+    if (scopedActionsSupported_ &&
+        (!haveRoundMeta_ || roundMetaPhase_ != Phase())) return;
     pendingAction_ = static_cast<uint8_t>(action);
+    pendingOperationId_ = SecureRandomU32();
+    pendingActionContext_ = {currentRoundId_, currentInviteId_, Phase()};
+    pendingActionStarted_ = Clock::now();
     nextAction_ = Clock::now();
+  }
+
+  void SendPendingAction() {
+    if (!scopedActionsSupported_) {
+      SendAction(static_cast<plink::PlayerAction>(pendingAction_));
+      return;
+    }
+    uint8_t bytes[plink::kMaxPacketSize]{};
+    plink::PacketWriter writer(bytes, sizeof(bytes), pcpair::kScopedActionPacketType,
+                               session_, ++sequence_, lastServerSequence_, lastServerTick_);
+    pcpair::ScopedAction action;
+    action.operationId = pendingOperationId_;
+    action.action = static_cast<plink::PlayerAction>(pendingAction_);
+    action.context = pendingActionContext_;
+    if (pcpair::WriteScopedAction(writer, action)) SendRaw(bytes, writer.Finish());
+  }
+
+  void FinishPairCancellation() {
+    lastCancelledRequest_ = pairingRequestId_;
+    pairingCancelPending_ = false;
+    pairingAttempted_ = false;
+    awaitingPairing_ = bindingId_ == 0;
+    serverConfirmedWaiting_ = false;
+    pairingCode_ = pairingRequestId_ = 0;
+    DeleteFileW((statePath_.wstring() + L".pairing").c_str());
+    pairingError_ = L"已停止匹配，可以重新输入";
   }
 
   void QueueReturn() {
@@ -1954,6 +2202,8 @@ class PetClient {
         message.deviceId != clientId_) return;
     lastPacketAt_ = Clock::now();
     const auto applyPeerVersion = [&]() {
+      scopedActionsSupported_ =
+          (message.compatibilityFlags & pcpair::ScopedActionsSupported) != 0;
       const bool wasForcedUpdate =
           majorVersionMismatch_ && localUpdateRequired_;
       peerAppVersion_ = message.appVersion;
@@ -1977,6 +2227,22 @@ class PetClient {
       if (mismatch && localUpdateRequired_ && !wasForcedUpdate)
         LogEvent("forced_update_required", message.appVersion.major);
     };
+    if (message.status == pcpair::Status::Matched && message.bindingId != 0 &&
+        ((pairingCancelPending_ && message.requestId == pairingRequestId_) ||
+         (lastCancelledRequest_ != 0 && message.requestId == lastCancelledRequest_)) &&
+        message.tokenLow != 0 && message.tokenHigh != 0) {
+      // Also cleans up a late Matched reply from a legacy server.
+      pcpair::Message revoke = message;
+      revoke.type = pcpair::MessageType::Unbind;
+      for (int attempt = 0; attempt < 3; ++attempt) SendControl(revoke);
+      return;
+    }
+    if (pairingCancelPending_ && message.requestId == pairingRequestId_ &&
+        (message.status == pcpair::Status::Cancelled ||
+         message.status == pcpair::Status::Unbound)) {
+      FinishPairCancellation();
+      return;
+    }
     if (message.status == pcpair::Status::Waiting && pairingAttempted_ &&
         message.requestId == pairingRequestId_) {
       serverConfirmedWaiting_ = true;
@@ -1985,6 +2251,7 @@ class PetClient {
                message.bindingId != 0 && message.assignedSlot >= 1 &&
                message.assignedSlot <= 2) {
       bindingId_ = message.bindingId;
+      resumeRequestId_ = SecureRandomU32();
       applyPeerVersion();
       tokenLow_ = message.tokenLow;
       tokenHigh_ = message.tokenHigh;
@@ -2008,6 +2275,7 @@ class PetClient {
         return;
       }
       LogEvent("pairing_matched", slot_);
+      DeleteFileW((statePath_.wstring() + L".pairing").c_str());
       SetPetMode(true);
       SendResume();
     } else if (message.status == pcpair::Status::Matched &&
@@ -2020,24 +2288,29 @@ class PetClient {
         connectionNoticeUntil_ = Clock::now() + std::chrono::seconds(12);
       }
     } else if (message.status == pcpair::Status::Cancelled &&
-               message.requestId == pairingRequestId_) {
+                pairingAttempted_ && message.requestId == pairingRequestId_) {
       pairingAttempted_ = false;
       awaitingPairing_ = true;
       serverConfirmedWaiting_ = false;
       pairingCode_ = 0;
       pairingRequestId_ = 0;
-    } else if (message.status == pcpair::Status::Invalid ||
-               message.status == pcpair::Status::AlreadyBound) {
+      DeleteFileW((statePath_.wstring() + L".pairing").c_str());
+    } else if ((message.status == pcpair::Status::Invalid ||
+                message.status == pcpair::Status::AlreadyBound) &&
+               pairingAttempted_ && message.requestId == pairingRequestId_) {
       pairingAttempted_ = false;
       awaitingPairing_ = true;
       serverConfirmedWaiting_ = false;
       pairingCode_ = 0;
       pairingRequestId_ = 0;
       pairingInput_.clear();
+      DeleteFileW((statePath_.wstring() + L".pairing").c_str());
       pairingError_ = message.status == pcpair::Status::AlreadyBound
                           ? L"该设备已经绑定，请保留身份存档"
                           : L"匹配请求无效，请重新输入";
-    } else if (message.status == pcpair::Status::StorageError) {
+    } else if (message.status == pcpair::Status::StorageError &&
+               ((pairingAttempted_ && message.requestId == pairingRequestId_) ||
+                (unbindPending_ && message.requestId == unbindRequestId_))) {
       const bool wasUnbinding = unbindPending_;
       pairingAttempted_ = false;
       unbindPending_ = false;
@@ -2057,8 +2330,10 @@ class PetClient {
                             : "pairing_storage_failed");
       SetPetMode(true);
     } else if (message.status == pcpair::Status::Unbound &&
-               (bindingId_ == 0 || message.bindingId == 0 ||
-                message.bindingId == bindingId_)) {
+                bindingId_ != 0 &&
+                (message.bindingId == bindingId_ ||
+                 (message.bindingId == 0 && unbindPending_ &&
+                  unbindRequestId_ != 0 && message.requestId == unbindRequestId_))) {
       LogEvent("binding_unbound");
       ClearBinding();
       statePersistenceOk_ = SaveState();
@@ -2072,7 +2347,11 @@ class PetClient {
       SetPetMode(true);
       FlashWindow(window_, TRUE);
     } else if (message.status == pcpair::Status::BindingMissing &&
-               bindingId_ != 0) {
+                bindingId_ != 0 &&
+                (message.bindingId == bindingId_ || message.bindingId == 0) &&
+                (message.requestId == resumeRequestId_ ||
+                 (unbindPending_ && unbindRequestId_ != 0 &&
+                  message.requestId == unbindRequestId_))) {
       LogEvent("binding_missing");
       ClearBinding();
       statePersistenceOk_ = SaveState();
@@ -2086,7 +2365,7 @@ class PetClient {
   }
 
   void ReceiveAll() {
-    for (;;) {
+    for (unsigned processed = 0; processed < 512; ++processed) {
       uint8_t bytes[pcpair::kMaxDatagramSize]{};
       sockaddr_in from{};
       int fromLength = sizeof(from);
@@ -2110,7 +2389,13 @@ class PetClient {
       plink::PacketHeader header;
       const uint8_t *payload = nullptr;
       if (!plink::ParsePacket(bytes, packetLength, header, payload)) continue;
-      if (header.type == pcpair::kRoundMetaPacketType) {
+      if (header.type == pcpair::kActionAckPacketType) {
+        uint32_t operationId = 0;
+        plink::PayloadReader reader(payload, header.payloadLength);
+        if (session_ != 0 && header.session == session_ &&
+            reader.U32(operationId) && reader.Done() &&
+            operationId == pendingOperationId_) pendingAction_ = 0;
+      } else if (header.type == pcpair::kRoundMetaPacketType) {
         if (session_ == 0 || header.session != session_ ||
             header.sequence <= lastServerSequence_) {
           continue;
@@ -2118,6 +2403,8 @@ class PetClient {
         pcpair::RoundMeta meta;
         plink::PayloadReader reader(payload, header.payloadLength);
         if (!pcpair::ReadRoundMeta(reader, meta)) continue;
+        haveRoundMeta_ = true;
+        roundMetaPhase_ = meta.phase;
         lastPacketAt_ = Clock::now();
         lastServerSequence_ = header.sequence;
         lastServerTick_ = header.tick;
@@ -2188,6 +2475,8 @@ class PetClient {
         const uint8_t previousInviterSlot = snapshot_.inviterSlot;
         snapshot_ = next;
         haveSnapshot_ = true;
+        if (pendingAction_ != 0 && snapshot_.phase != pendingActionContext_.phase)
+          pendingAction_ = 0;
         const bool peerOnline = OpponentOnline();
         if (!peerOnlineKnown_ || peerOnline != lastPeerOnline_) {
           peerOnlineKnown_ = true;
@@ -2460,8 +2749,11 @@ class PetClient {
     AdjustWindowRectEx(&gameRect, gameStyle, FALSE, gameExStyle);
     const int gameWidth = gameRect.right - gameRect.left;
     const int gameHeight = gameRect.bottom - gameRect.top;
-    RECT work{};
-    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0);
+    MONITORINFO monitor{};
+    monitor.cbSize = sizeof(monitor);
+    RECT anchor{petX_, petY_, petX_ + kPetWidth, petY_ + kPetHeight};
+    GetMonitorInfoW(MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST), &monitor);
+    const RECT work = monitor.rcWork;
     const int gameX = std::clamp(
         petX_, static_cast<int>(work.left),
         std::max(static_cast<int>(work.left),
@@ -3497,6 +3789,16 @@ class PetClient {
   uint32_t clientId_ = 0;
   uint32_t pairingCode_ = 123456;
   uint32_t pairingRequestId_ = 0;
+  uint32_t lastCancelledRequest_ = 0;
+  uint32_t unbindRequestId_ = 0;
+  uint32_t pendingOperationId_ = 0;
+  pcpair::RoundMeta pendingActionContext_{};
+  Clock::time_point pendingActionStarted_{};
+  plink::GamePhase roundMetaPhase_ = plink::GamePhase::Menu;
+  bool haveRoundMeta_ = false;
+  bool scopedActionsSupported_ = false;
+  bool pairingCancelPending_ = false;
+  bool updating_ = false;
   uint32_t resumeRequestId_ = 0;
   uint32_t bindingId_ = 0;
   uint32_t tokenLow_ = 0;
@@ -3516,9 +3818,14 @@ class PetClient {
   uint64_t currentInviteId_ = 0;
   uint64_t lastRecordedRoundId_ = 0;
   uint64_t telemetrySessionId_ = 0;
+  int64_t telemetryActiveMillis_ = 0;
+  Clock::time_point telemetryActiveSince_{};
+  bool telemetrySegmentOpen_ = false;
   uint64_t telemetryEventSequence_ = 0;
   uint64_t updateSnoozeUntilMs_ = 0;
   uint64_t lastUpdateGeneration_ = 0;
+  uint64_t lastUpdatePromptGeneration_ = 0;
+  plane_pet_update::State lastUpdateState_ = plane_pet_update::State::Disabled;
   uint8_t slot_ = 1;
   uint8_t currentInput_ = 0;
   uint8_t inputHistory_[3]{};
@@ -3585,6 +3892,8 @@ NOTIFYICONDATAW gTray{};
 bool gTrayAdded = false;
 HWND gInfoWindow = nullptr;
 HWND gUpdateWindow = nullptr;
+uint64_t gUpdateContentGeneration = UINT64_MAX;
+uint32_t gUpdateContentProgress = UINT32_MAX;
 
 void UpdateCardText(HDC dc, const std::wstring &text, RECT rect, int height,
                     COLORREF color, int weight = FW_NORMAL,
@@ -3619,15 +3928,34 @@ constexpr int kUpdateCardHeight = 244;
 constexpr RECT kUpdatePrimaryButton{24, 194, 171, 229};
 constexpr RECT kUpdateSecondaryButton{189, 194, 336, 229};
 constexpr RECT kUpdateCloseButton{326, 12, 348, 34};
+constexpr RECT kUpdateCloseHitRect{318, 4, 356, 42};
+enum class UpdateCardButton { None, Close, Download, Retry, Secondary };
+UpdateCardButton gUpdatePressedButton = UpdateCardButton::None;
 
-void RepositionUpdateWindow(HWND owner) {
+UpdateCardButton UpdateCardButtonAt(POINT point,
+                                    const plane_pet_update::Snapshot &state) {
+  if (PtInRect(&kUpdateCloseHitRect, point)) return UpdateCardButton::Close;
+  if (PtInRect(&kUpdatePrimaryButton, point)) {
+    if (state.canDownload) return UpdateCardButton::Download;
+    if (state.state == plane_pet_update::State::Error ||
+        state.state == plane_pet_update::State::Required)
+      return UpdateCardButton::Retry;
+  }
+  if (PtInRect(&kUpdateSecondaryButton, point))
+    return UpdateCardButton::Secondary;
+  return UpdateCardButton::None;
+}
+
+bool RepositionUpdateWindow(HWND owner) {
   if (gUpdateWindow == nullptr || !IsWindow(gUpdateWindow) ||
-      !IsWindowVisible(gUpdateWindow)) return;
+      owner == nullptr || !IsWindow(owner)) return false;
   RECT pet{};
-  GetWindowRect(owner, &pet);
+  if (!GetWindowRect(owner, &pet)) return false;
   MONITORINFO monitor{};
   monitor.cbSize = sizeof(monitor);
-  GetMonitorInfoW(MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &monitor);
+  if (!GetMonitorInfoW(
+          MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST), &monitor))
+    return false;
   int x = pet.right + 8;
   if (x + kUpdateCardWidth > monitor.rcWork.right)
     x = pet.left - kUpdateCardWidth - 8;
@@ -3639,15 +3967,34 @@ void RepositionUpdateWindow(HWND owner) {
       static_cast<int>(pet.top), static_cast<int>(monitor.rcWork.top),
       std::max(static_cast<int>(monitor.rcWork.top),
                static_cast<int>(monitor.rcWork.bottom) - kUpdateCardHeight));
+  RECT current{};
+  if (GetWindowRect(gUpdateWindow, &current) && current.left == x &&
+      current.top == y && current.right - current.left == kUpdateCardWidth &&
+      current.bottom - current.top == kUpdateCardHeight) {
+    return false;
+  }
   SetWindowPos(gUpdateWindow, HWND_TOPMOST, x, y, kUpdateCardWidth,
-               kUpdateCardHeight, SWP_NOACTIVATE);
+               kUpdateCardHeight, SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+  return true;
+}
+
+bool RefreshUpdateWindowContent(uint64_t generation, uint32_t progress) {
+  if (gUpdateWindow == nullptr || !IsWindow(gUpdateWindow) ||
+      !IsWindowVisible(gUpdateWindow)) return false;
+  if (gUpdateContentGeneration == generation &&
+      gUpdateContentProgress == progress) return false;
+  gUpdateContentGeneration = generation;
+  gUpdateContentProgress = progress;
   InvalidateRect(gUpdateWindow, nullptr, FALSE);
+  return true;
 }
 
 void CloseUpdateWindow() {
   if (gUpdateWindow != nullptr && IsWindow(gUpdateWindow))
     DestroyWindow(gUpdateWindow);
   gUpdateWindow = nullptr;
+  gUpdateContentGeneration = UINT64_MAX;
+  gUpdateContentProgress = UINT32_MAX;
 }
 
 LRESULT CALLBACK UpdateWindowProcedure(HWND window, UINT message,
@@ -3655,9 +4002,20 @@ LRESULT CALLBACK UpdateWindowProcedure(HWND window, UINT message,
   switch (message) {
     case WM_PAINT: {
       PAINTSTRUCT paint{};
-      HDC dc = BeginPaint(window, &paint);
+      HDC target = BeginPaint(window, &paint);
       RECT client{};
       GetClientRect(window, &client);
+      const int width = std::max<LONG>(1, client.right - client.left);
+      const int height = std::max<LONG>(1, client.bottom - client.top);
+      HDC memory = CreateCompatibleDC(target);
+      HBITMAP bitmap = memory == nullptr
+          ? nullptr : CreateCompatibleBitmap(target, width, height);
+      HGDIOBJ previousBitmap = nullptr;
+      HDC dc = target;
+      if (memory != nullptr && bitmap != nullptr) {
+        previousBitmap = SelectObject(memory, bitmap);
+        dc = memory;
+      }
       HBRUSH background = CreateSolidBrush(RGB(11, 16, 27));
       FillRect(dc, &client, background);
       DeleteObject(background);
@@ -3686,9 +4044,12 @@ LRESULT CALLBACK UpdateWindowProcedure(HWND window, UINT message,
       int summaryY = 105;
       for (const std::wstring &line : state.summary) {
         if (line.empty()) continue;
+        if (state.state == plane_pet_update::State::Downloading && summaryY >= 150)
+          break;
         RECT summaryRect{27, summaryY, 337, summaryY + 25};
         UpdateCardText(dc, L"• " + line, summaryRect, 16,
-                       RGB(215, 226, 244));
+                       RGB(215, 226, 244), FW_NORMAL,
+                       DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
         summaryY += 24;
       }
       if (state.state == plane_pet_update::State::Downloading) {
@@ -3700,9 +4061,7 @@ LRESULT CALLBACK UpdateWindowProcedure(HWND window, UINT message,
             std::min(100U, state.progressPercent) / 100U);
         if (bar.right > bar.left)
           UpdateCardPanel(dc, bar, RGB(35, 199, 132), RGB(35, 199, 132));
-      } else if (state.state == plane_pet_update::State::Available ||
-                 (state.state == plane_pet_update::State::Required &&
-                  !state.latestVersion.empty())) {
+      } else if (state.canDownload) {
         UpdateCardPanel(dc, kUpdatePrimaryButton, RGB(23, 150, 105),
                         RGB(74, 236, 169));
         UpdateCardText(dc, L"下载并升级", kUpdatePrimaryButton, 18, kWhite,
@@ -3713,7 +4072,8 @@ LRESULT CALLBACK UpdateWindowProcedure(HWND window, UINT message,
                        state.required ? L"暂时离线使用" : L"7 天后提醒",
                        kUpdateSecondaryButton, 17, kWhite, FW_BOLD,
                        DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-      } else if (state.state == plane_pet_update::State::Error) {
+      } else if (state.state == plane_pet_update::State::Error ||
+                 state.state == plane_pet_update::State::Required) {
         UpdateCardPanel(dc, kUpdatePrimaryButton, RGB(38, 81, 120), kBlue);
         UpdateCardText(dc, L"重新检查", kUpdatePrimaryButton, 18, kWhite,
                        FW_BOLD, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -3722,27 +4082,55 @@ LRESULT CALLBACK UpdateWindowProcedure(HWND window, UINT message,
         UpdateCardText(dc, L"关闭", kUpdateSecondaryButton, 18, kWhite,
                        FW_BOLD, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
       }
+      if (state.state == plane_pet_update::State::Checking ||
+          state.state == plane_pet_update::State::Current ||
+          state.state == plane_pet_update::State::Downloading) {
+        UpdateCardPanel(dc, kUpdateSecondaryButton, RGB(43, 49, 63), kCardEdge);
+        UpdateCardText(dc,
+                       state.state == plane_pet_update::State::Downloading
+                           ? L"取消下载" : L"关闭",
+                       kUpdateSecondaryButton, 18, kWhite, FW_BOLD,
+                       DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+      }
+      if (dc == memory)
+        BitBlt(target, 0, 0, width, height, memory, 0, 0, SRCCOPY);
+      if (previousBitmap != nullptr) SelectObject(memory, previousBitmap);
+      if (bitmap != nullptr) DeleteObject(bitmap);
+      if (memory != nullptr) DeleteDC(memory);
       EndPaint(window, &paint);
+      return 0;
+    }
+    case WM_LBUTTONDOWN: {
+      const POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
+      gUpdatePressedButton = UpdateCardButtonAt(point, gClient.UpdateSnapshot());
+      if (gUpdatePressedButton != UpdateCardButton::None) SetCapture(window);
       return 0;
     }
     case WM_LBUTTONUP: {
       POINT point{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
       const auto state = gClient.UpdateSnapshot();
-      if (PtInRect(&kUpdateCloseButton, point)) {
+      const auto pressed = gUpdatePressedButton;
+      gUpdatePressedButton = UpdateCardButton::None;
+      if (GetCapture() == window) ReleaseCapture();
+      if (pressed == UpdateCardButton::None ||
+          pressed != UpdateCardButtonAt(point, state)) return 0;
+      if (pressed == UpdateCardButton::Close ||
+          pressed == UpdateCardButton::Secondary) {
         gClient.DeclineOrDismissUpdate();
-      } else if ((state.state == plane_pet_update::State::Available ||
-                  state.state == plane_pet_update::State::Required) &&
-                 !state.latestVersion.empty() &&
-                 PtInRect(&kUpdatePrimaryButton, point)) {
+      } else if (state.canDownload) {
         gClient.AcceptUpdate();
-      } else if (state.state == plane_pet_update::State::Error &&
-                 PtInRect(&kUpdatePrimaryButton, point)) {
+      } else if (state.state == plane_pet_update::State::Error ||
+                 state.state == plane_pet_update::State::Required) {
         gClient.ManualUpdateCheck();
-      } else if (PtInRect(&kUpdateSecondaryButton, point)) {
-        gClient.DeclineOrDismissUpdate();
       }
       return 0;
     }
+    case WM_CAPTURECHANGED:
+      gUpdatePressedButton = UpdateCardButton::None;
+      return 0;
+    case WM_KEYDOWN:
+      if (wParam == VK_ESCAPE) gClient.DeclineOrDismissUpdate();
+      return 0;
     case WM_ERASEBKGND:
       return 1;
     case WM_CLOSE:
@@ -3750,7 +4138,12 @@ LRESULT CALLBACK UpdateWindowProcedure(HWND window, UINT message,
       gClient.DeclineOrDismissUpdate();
       return 0;
     case WM_DESTROY:
-      if (window == gUpdateWindow) gUpdateWindow = nullptr;
+      gUpdatePressedButton = UpdateCardButton::None;
+      if (window == gUpdateWindow) {
+        gUpdateWindow = nullptr;
+        gUpdateContentGeneration = UINT64_MAX;
+        gUpdateContentProgress = UINT32_MAX;
+      }
       return 0;
     default:
       return DefWindowProcW(window, message, wParam, lParam);
@@ -3758,17 +4151,26 @@ LRESULT CALLBACK UpdateWindowProcedure(HWND window, UINT message,
 }
 
 void ShowUpdateWindow(HWND owner, bool activate) {
+  bool created = false;
   if (gUpdateWindow == nullptr || !IsWindow(gUpdateWindow)) {
     gUpdateWindow = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST, kUpdateWindowClassName,
         L"Plane Pet 软件更新", WS_POPUP, 0, 0, kUpdateCardWidth,
         kUpdateCardHeight, owner, nullptr, GetModuleHandleW(nullptr), nullptr);
+    created = gUpdateWindow != nullptr;
   }
   if (gUpdateWindow == nullptr) return;
+  if (created) {
+    gUpdateContentGeneration = UINT64_MAX;
+    gUpdateContentProgress = UINT32_MAX;
+  }
   RepositionUpdateWindow(owner);
-  ShowWindow(gUpdateWindow, activate ? SW_SHOWNORMAL : SW_SHOWNOACTIVATE);
-  InvalidateRect(gUpdateWindow, nullptr, FALSE);
-  if (activate) SetForegroundWindow(gUpdateWindow);
+  const bool wasVisible = IsWindowVisible(gUpdateWindow) != FALSE;
+  if (!wasVisible)
+    ShowWindow(gUpdateWindow, activate ? SW_SHOWNORMAL : SW_SHOWNOACTIVATE);
+  const auto state = gClient.UpdateSnapshot();
+  RefreshUpdateWindowContent(state.generation, state.progressPercent);
+  if (activate && !wasVisible) SetForegroundWindow(gUpdateWindow);
 }
 
 HICON PlanePetIcon(int width, int height) {
@@ -3791,7 +4193,14 @@ constexpr int kHistoryWidth = 560;
 constexpr int kHistoryContentHeight = 600;
 constexpr int kHelpWidth = 700;
 constexpr int kHelpViewportHeight = 740;
-constexpr int kHelpContentHeight = 1260;
+constexpr int kHelpContentHeight = 1284;
+
+void RefreshHistoryInfoWindow() {
+  if (gInfoWindow != nullptr && IsWindow(gInfoWindow) &&
+      gInfoWindowMode == InfoWindowMode::History) {
+    InvalidateRect(gInfoWindow, nullptr, FALSE);
+  }
+}
 
 int InfoBaseWidth() {
   return gInfoWindowMode == InfoWindowMode::History
@@ -3846,9 +4255,23 @@ LRESULT CALLBACK InfoWindowProcedure(HWND window, UINT message, WPARAM wParam,
   switch (message) {
     case WM_PAINT: {
       PAINTSTRUCT paint{};
-      HDC dc = BeginPaint(window, &paint);
+      HDC target = BeginPaint(window, &paint);
       RECT physical{};
       GetClientRect(window, &physical);
+      const int physicalWidth =
+          std::max<LONG>(1, physical.right - physical.left);
+      const int physicalHeight =
+          std::max<LONG>(1, physical.bottom - physical.top);
+      HDC memory = CreateCompatibleDC(target);
+      HBITMAP bitmap = memory == nullptr
+          ? nullptr
+          : CreateCompatibleBitmap(target, physicalWidth, physicalHeight);
+      HGDIOBJ previousBitmap = nullptr;
+      HDC dc = target;
+      if (memory != nullptr && bitmap != nullptr) {
+        previousBitmap = SelectObject(memory, bitmap);
+        dc = memory;
+      }
       const int page = InfoPageHeight(window);
       const int saved = SaveDC(dc);
       SetMapMode(dc, MM_ANISOTROPIC);
@@ -3864,6 +4287,12 @@ LRESULT CALLBACK InfoWindowProcedure(HWND window, UINT message, WPARAM wParam,
         gClient.DrawHelpWindow(dc, rect);
       }
       RestoreDC(dc, saved);
+      if (dc == memory)
+        BitBlt(target, 0, 0, physicalWidth, physicalHeight, memory, 0, 0,
+               SRCCOPY);
+      if (previousBitmap != nullptr) SelectObject(memory, previousBitmap);
+      if (bitmap != nullptr) DeleteObject(bitmap);
+      if (memory != nullptr) DeleteDC(memory);
       EndPaint(window, &paint);
       return 0;
     }
@@ -3915,6 +4344,14 @@ LRESULT CALLBACK InfoWindowProcedure(HWND window, UINT message, WPARAM wParam,
 }
 
 void ShowInfoWindow(HWND owner, InfoWindowMode mode) {
+  if (gInfoWindow != nullptr && IsWindow(gInfoWindow) &&
+      gInfoWindowMode == mode &&
+      gInfoDpi == static_cast<int>(WindowDpi(owner))) {
+    if (!IsWindowVisible(gInfoWindow)) ShowWindow(gInfoWindow, SW_SHOWNORMAL);
+    InvalidateRect(gInfoWindow, nullptr, FALSE);
+    SetForegroundWindow(gInfoWindow);
+    return;
+  }
   CloseInfoWindow();
   gInfoWindowMode = mode;
   gInfoScrollOffset = 0;
@@ -4046,7 +4483,7 @@ void ShowPetContextMenu(HWND window) {
   AppendMenuW(menu, MF_STRING, kMenuHide, L"隐藏悬浮窗");
   AppendMenuW(menu, MF_STRING, kMenuExit, L"退出");
   SetForegroundWindow(window);
-  TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
+  PetTrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, window, nullptr);
   DestroyMenu(menu);
   PostMessageW(window, WM_NULL, 0, 0);
 }
@@ -4054,6 +4491,15 @@ void ShowPetContextMenu(HWND window) {
 LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
                                  LPARAM lParam) {
   switch (message) {
+    case WM_TIMER:
+      if (wParam == kNetworkPumpTimer) {
+        // Native menus/dialogs run nested message loops. Keep the same guarded
+        // client pump alive there; otherwise a menu alone causes a disconnect.
+        gClient.Update();
+        if (IsWindowVisible(window)) InvalidateRect(window, nullptr, FALSE);
+        return 0;
+      }
+      break;
     case WM_NCHITTEST: {
       if (gClient.IsGameMode())
         return DefWindowProcW(window, message, wParam, lParam);
@@ -4146,7 +4592,7 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, kMenuExit, L"退出");
         SetForegroundWindow(window);
-        TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, window,
+        PetTrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, window,
                        nullptr);
         DestroyMenu(menu);
       }
@@ -4178,13 +4624,16 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
         gClient.RequestUnbind();
       return 0;
     case plane_pet_update::kChangedMessage:
-      if (gUpdateWindow != nullptr)
-        InvalidateRect(gUpdateWindow, nullptr, FALSE);
+      if (gUpdateWindow != nullptr) {
+        const auto state = gClient.UpdateSnapshot();
+        RefreshUpdateWindowContent(state.generation, state.progressPercent);
+      }
       return 0;
     case plane_pet_update::kInstallMessage:
       gClient.BeginUpdateInstall();
       return 0;
     case WM_DESTROY:
+      KillTimer(window, kNetworkPumpTimer);
       CloseInfoWindow();
       CloseUpdateWindow();
       UnregisterHotKey(window, kBossHotkeyId);
@@ -4194,7 +4643,12 @@ LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam,
     default:
       return DefWindowProcW(window, message, wParam, lParam);
   }
+  return DefWindowProcW(window, message, wParam, lParam);
 }
+
+#ifdef PLANE_PET_UPDATE_WINDOW_SELF_TEST
+#include "../tests/update_window_cases.h"
+#endif
 
 }  // namespace
 
@@ -4216,24 +4670,23 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
   windowClass.lpszClassName = kWindowClassName;
   if (!RegisterClassW(&windowClass)) return 1;
   WNDCLASSW infoClass{};
-  infoClass.style = CS_HREDRAW | CS_VREDRAW;
+  infoClass.style = 0;
   infoClass.lpfnWndProc = InfoWindowProcedure;
   infoClass.hInstance = instance;
   infoClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
   infoClass.hIcon = PlanePetIcon(GetSystemMetrics(SM_CXICON),
                                  GetSystemMetrics(SM_CYICON));
-  infoClass.hbrBackground =
-      static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+  infoClass.hbrBackground = nullptr;
   infoClass.lpszClassName = kInfoWindowClassName;
   if (!RegisterClassW(&infoClass)) return 1;
   WNDCLASSW updateClass{};
-  updateClass.style = CS_HREDRAW | CS_VREDRAW;
+  updateClass.style = 0;
   updateClass.lpfnWndProc = UpdateWindowProcedure;
   updateClass.hInstance = instance;
   updateClass.hCursor = LoadCursor(nullptr, IDC_ARROW);
   updateClass.hIcon = PlanePetIcon(GetSystemMetrics(SM_CXICON),
                                    GetSystemMetrics(SM_CYICON));
-  updateClass.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+  updateClass.hbrBackground = nullptr;
   updateClass.lpszClassName = kUpdateWindowClassName;
   if (!RegisterClassW(&updateClass)) return 1;
   HWND window = CreateWindowExW(
@@ -4242,6 +4695,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
       nullptr, nullptr, instance, nullptr);
   if (window == nullptr) return 1;
   if (!gClient.Initialize(window)) return 2;
+  SetTimer(window, kNetworkPumpTimer, 16, nullptr);
+#ifdef PLANE_PET_UPDATE_WINDOW_SELF_TEST
+  const bool updateWindowsOk = RunUpdateWindowSelfTest(window);
+  gClient.Shutdown();
+  DestroyWindow(window);
+  return updateWindowsOk ? 0 : 9;
+#endif
 #ifdef PLANE_PET_INFO_SELF_TEST
   const auto validInfoWindow = [&](InfoWindowMode mode, int baseWidth,
                                    int baseHeight) {
@@ -4269,8 +4729,12 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
   CloseInfoWindow();
   ShowUpdateWindow(window, false);
   RECT updateClient{};
+  const bool updatePaintOk =
+      gUpdateWindow != nullptr &&
+      RedrawWindow(gUpdateWindow, nullptr, nullptr,
+                   RDW_INVALIDATE | RDW_UPDATENOW) != FALSE;
   const bool updateWindowOk =
-      gUpdateWindow != nullptr && IsWindow(gUpdateWindow) &&
+      updatePaintOk && gUpdateWindow != nullptr && IsWindow(gUpdateWindow) &&
       IsWindowVisible(gUpdateWindow) &&
       GetWindow(gUpdateWindow, GW_OWNER) == window &&
       GetClientRect(gUpdateWindow, &updateClient) &&
@@ -4278,6 +4742,14 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
       updateClient.bottom - updateClient.top == kUpdateCardHeight &&
       (GetWindowLongPtrW(gUpdateWindow, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0 &&
       (GetWindowLongPtrW(gUpdateWindow, GWL_EXSTYLE) & WS_EX_APPWINDOW) == 0;
+  const auto updateSnapshot = gClient.UpdateSnapshot();
+  const bool steadyUpdateWindowOk =
+      !RepositionUpdateWindow(window) &&
+      !RefreshUpdateWindowContent(updateSnapshot.generation,
+                                  updateSnapshot.progressPercent) &&
+      (GetClassLongPtrW(gUpdateWindow, GCL_STYLE) &
+       (CS_HREDRAW | CS_VREDRAW)) == 0 &&
+      GetClassLongPtrW(gUpdateWindow, GCLP_HBRBACKGROUND) == 0;
   CloseUpdateWindow();
   const bool coloredHeartOk = gClient.RunColoredHeartHudSelfTest();
   const bool finishedCloseOk = gClient.RunFinishedCloseSelfTest();
@@ -4290,7 +4762,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
          (coloredHeartOk ? 0 : 8) |
          (finishedCloseOk ? 0 : 16) |
          (historyPersistenceOk ? 0 : 32) |
-         (updateWindowOk ? 0 : 64);
+         (updateWindowOk ? 0 : 64) |
+         (steadyUpdateWindowOk ? 0 : 128);
 #endif
   RegisterHotKey(window, kBossHotkeyId,
                  MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, 'H');
@@ -4307,6 +4780,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
       TranslateMessage(&message);
       DispatchMessageW(&message);
     }
+    if (!running) break;
     gClient.Update();
     const auto now = Clock::now();
     if (now >= nextFrame) {

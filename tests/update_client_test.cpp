@@ -4,11 +4,15 @@
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
+#include <string>
 #include <thread>
 
+#include "../common/app_version.h"
 #include "../desktop/update_manager.h"
 
-int main() {
+int main(int argc, char **argv) {
+  const std::string expected = argc > 1 ? argv[1] : plane_pet_version::kString;
+  const std::wstring expectedWide(expected.begin(), expected.end());
   plane_pet_update::Manager manager;
   const std::filesystem::path request =
       std::filesystem::temp_directory_path() /
@@ -25,9 +29,11 @@ int main() {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     manager.Tick(true, false, false, false);
     snapshot = manager.GetSnapshot();
-    if (snapshot.state == plane_pet_update::State::Current) {
-      std::printf("PLANE_PET_UPDATE_CLIENT_OK latest=1.0.0 signed=1\n");
-      return snapshot.latestVersion == L"1.0.0" ? 0 : 2;
+    if (snapshot.state == plane_pet_update::State::Current ||
+        snapshot.state == plane_pet_update::State::Available) {
+      if (snapshot.latestVersion != expectedWide) return 2;
+      std::printf("PLANE_PET_UPDATE_CLIENT_OK latest=%s signed=1\n", expected.c_str());
+      return 0;
     }
     if (snapshot.state == plane_pet_update::State::Error) {
       std::printf("PLANE_PET_UPDATE_CLIENT_FAILED state=error\n");

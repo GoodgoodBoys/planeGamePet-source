@@ -24,7 +24,7 @@ $target = Join-Path $testRoot "PlanePet.exe"
 $package = Join-Path $updates "PlanePet.exe.download"
 New-Item -ItemType Directory -Force -Path $updates | Out-Null
 
-function Invoke-Updater([string]$ExpectedHash) {
+function Invoke-Updater([string]$ExpectedHash, [bool]$Recover = $false) {
     $shortLived = Start-Process -FilePath $env:ComSpec `
         -ArgumentList "/c ping 127.0.0.1 -n 2 >nul" -PassThru `
         -WindowStyle Hidden
@@ -37,6 +37,7 @@ function Invoke-Updater([string]$ExpectedHash) {
         "--data=`"$data`"",
         "--trace=1"
     )
+    if ($Recover) { $arguments += "--recover=1" }
     $process = Start-Process -FilePath $updater -ArgumentList $arguments `
         -PassThru -WindowStyle Hidden
     if (-not $process.WaitForExit(90000)) {
@@ -80,6 +81,43 @@ try {
     }
     Write-Host "PLANE_PET_UPDATER_INSTALL_OK"
     Write-Host "PLANE_PET_UPDATER_ROLLBACK_OK"
+    Start-Sleep -Milliseconds 250
+    $restartMarker = Join-Path $data "old-version-restarted"
+    if (-not (Test-Path -LiteralPath $restartMarker)) { throw "Old version was not restarted" }
+    Remove-Item -LiteralPath $restartMarker -Force
+    $hashFailure = Invoke-Updater ('0' * 64)
+    Start-Sleep -Milliseconds 250
+    if ($hashFailure -ne 3 -or -not (Test-Path -LiteralPath $restartMarker) -or
+        (Get-FileHash -LiteralPath $target).Hash.ToLower() -ne $originalHash) {
+        throw "Hash rejection did not restart the untouched old version"
+    }
+    Write-Host "PLANE_PET_UPDATER_BAD_HASH_RESTART_OK"
+    # Deny just the pending journal write, without changing OS permissions.
+    $blockedJournal = Join-Path $data "update.pending.tmp"
+    New-Item -ItemType Directory -Path $blockedJournal | Out-Null
+    $journalFailure = Invoke-Updater $badHash
+    Remove-Item -LiteralPath $blockedJournal -Force
+    if ($journalFailure -ne 6 -or
+        (Get-FileHash -LiteralPath $target).Hash.ToLower() -ne $originalHash) {
+        throw "Journal failure changed the installed binary"
+    }
+    Write-Host "PLANE_PET_UPDATER_JOURNAL_FAILURE_OK"
+    Start-Sleep -Milliseconds 250
+    # Simulate a power loss after replacement, before the health marker.
+    Copy-Item -LiteralPath $target -Destination "$target.old"
+    Copy-Item -LiteralPath $unhealthyStub -Destination $target -Force
+    [IO.File]::WriteAllText((Join-Path $data "update.pending"),
+        "1234-5678`n$target.old`n", [Text.UTF8Encoding]::new($false))
+    Remove-Item -LiteralPath (Join-Path $data "update.health") -Force -ErrorAction SilentlyContinue
+    $recovery = Invoke-Updater $badHash $true
+    if ($recovery -ne 0 -or
+        (Get-FileHash -LiteralPath $target).Hash.ToLower() -ne $originalHash -or
+        (Test-Path -LiteralPath "$target.old") -or
+        (Test-Path -LiteralPath (Join-Path $data "update.pending"))) {
+        throw "Interrupted install did not recover"
+    }
+    Write-Host "PLANE_PET_UPDATER_INTERRUPTED_RECOVERY_OK"
+    Start-Sleep -Milliseconds 250
 }
 finally {
     $resolvedRoot = [IO.Path]::GetFullPath($testRoot)

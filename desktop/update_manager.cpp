@@ -22,6 +22,10 @@ constexpr wchar_t kAllowedHost[] =
     L"egg-ota-test.oss-cn-beijing.aliyuncs.com";
 constexpr size_t kMaximumManifestBytes = 64U * 1024U;
 constexpr uint64_t kMaximumArtifactBytes = 64ULL * 1024ULL * 1024ULL;
+struct WorkerCompletion {
+  std::atomic<bool> &running;
+  ~WorkerCompletion() { running.store(false); }
+};
 constexpr char kPublicModulusBase64[] =
     "tRSXy4RGnHkle5TcsSSee2UIrNcW6PCsuRGgXE8Mhe5kgq2Ek+lazQPEfGq4bz2A"
     "zCSxOkECubyeFGYFQXUrNqkVSfNJVBvWwevAMgB3MXkFaPyfxoFNeVdlULXYAkDc"
@@ -201,6 +205,7 @@ bool HttpGet(const std::string &url, size_t maximum,
              std::vector<uint8_t> &result,
              const std::atomic<bool> *cancel = nullptr,
              std::atomic<unsigned> *progress = nullptr) {
+  if (cancel != nullptr && cancel->load()) return false;
   ParsedUrl parsed;
   if (!ParseAllowedUrl(url, parsed)) return false;
   HINTERNET session = WinHttpOpen(
@@ -255,7 +260,7 @@ bool HttpGet(const std::string &url, size_t maximum,
       break;
     }
     if (received == 0) break;
-    if (result.size() > maximum - received) {
+    if (received > maximum || result.size() > maximum - received) {
       ok = false;
       break;
     }
@@ -368,7 +373,9 @@ bool ParseManifest(const std::vector<uint8_t> &bytes,
   }
   std::array<unsigned, 3> parsed{};
   if (!ParseVersion(manifest.version, parsed) ||
-      !ParseVersion(manifest.minimumVersion, parsed)) return false;
+      !ParseVersion(manifest.minimumVersion, parsed) ||
+      CompareVersion(manifest.minimumVersion, manifest.version) > 0)
+    return false;
   for (char ch : manifest.sha256)
     if (!std::isxdigit(static_cast<unsigned char>(ch))) return false;
   std::transform(manifest.sha256.begin(), manifest.sha256.end(),
@@ -403,6 +410,13 @@ bool WriteBytesAtomically(const std::filesystem::path &target,
 
 }  // namespace
 
+bool ShouldShowPrompt(const Snapshot &snapshot, bool petVisible) {
+  if (snapshot.state == State::Disabled || snapshot.state == State::Idle)
+    return false;
+  return snapshot.manual || snapshot.required ||
+         (petVisible && snapshot.state == State::Available);
+}
+
 Manager::~Manager() {
   cancel_.store(true);
   if (worker_.joinable()) worker_.join();
@@ -433,9 +447,23 @@ void Manager::JoinFinishedWorker() {
 }
 
 void Manager::Tick(bool idleUiAvailable, bool peerVersionDiffers,
-                   bool localUpdateAvailable, bool peerMajorMismatch) {
+                    bool localUpdateAvailable, bool peerMajorMismatch,
+                    uint32_t peerVersionKey) {
+  if (!peerVersionDiffers || peerVersionKey != lastPeerVersionKey_ ||
+      peerMajorMismatch != lastPeerMajorRequirement_)
+    peerRequirementHandled_ = false;
+  lastPeerVersionKey_ = peerVersionKey;
+  lastPeerMajorRequirement_ = peerMajorMismatch;
   JoinFinishedWorker();
   if (!Enabled() || workerRunning_.load()) return;
+  if (pendingManualCheck_) {
+    if (!idleUiAvailable) return;
+    const bool required = pendingRequiredCheck_;
+    pendingManualCheck_ = pendingRequiredCheck_ = false;
+    StartCheck(true, required);
+    return;
+  }
+  if (GetSnapshot().state == State::Downloading) return;
   const uint64_t now = UnixTimeMillis();
   if (peerVersionDiffers && localUpdateAvailable &&
       !peerRequirementHandled_) {
@@ -454,56 +482,104 @@ void Manager::Tick(bool idleUiAvailable, bool peerVersionDiffers,
 
 void Manager::StartCheck(bool manual, bool requiredByPeer) {
   JoinFinishedWorker();
-  if (workerRunning_.exchange(true)) return;
-  cancel_.store(false);
+  if (!Enabled()) return;
+  if (requiredByPeer) peerRequirementHandled_ = true;
+  if (workerRunning_.load()) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (manual && cancel_.load()) {
+      // A canceled synchronous HTTP request can still be unwinding. Keep its
+      // cancellation set and start the new request after joining that worker.
+      pendingManualCheck_ = true;
+      pendingRequiredCheck_ = requiredByPeer;
+      const uint64_t generation = snapshot_.generation;
+      snapshot_ = Snapshot{};
+      snapshot_.currentVersion = plane_pet_version::kWideString;
+      snapshot_.state = State::Checking;
+      snapshot_.manual = true;
+      snapshot_.required = requiredByPeer;
+      snapshot_.message = L"正在重新检查新版本…";
+      snapshot_.generation = generation + 1;
+    } else if (manual) {
+      // A manual click during an automatic check makes that same result
+      // visible, without racing a second worker or interrupting a download.
+      snapshot_.manual = true;
+      snapshot_.required = snapshot_.required || requiredByPeer;
+      ++snapshot_.generation;
+    }
+    return;
+  }
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    if (snapshot_.state == State::Downloading) return;
+    cancel_.store(false);
+    installRequestReady_.store(false);
+    const uint64_t generation = snapshot_.generation;
+    snapshot_ = Snapshot{};
+    snapshot_.currentVersion = plane_pet_version::kWideString;
     snapshot_.state = State::Checking;
     snapshot_.manual = manual;
     snapshot_.required = requiredByPeer;
     snapshot_.message = L"正在安全检查新版本…";
     snapshot_.progressPercent = 0;
     downloadProgress_.store(0);
-    ++snapshot_.generation;
+    snapshot_.generation = generation + 1;
+    manifest_ = Manifest{};
   }
+  nextAutomaticCheckMs_ = UnixTimeMillis() + 24ULL * 60 * 60 * 1000;
+  workerRunning_.store(true);
   PostMessageW(owner_, kChangedMessage, 0, 0);
-  worker_ = std::thread(&Manager::CheckWorker, this, manual, requiredByPeer);
+  try {
+    worker_ = std::thread(&Manager::CheckWorker, this);
+  } catch (...) {
+    SetError(L"无法启动更新检查，请稍后重试。");
+    workerRunning_.store(false);
+  }
 }
 
-void Manager::CheckNow() { StartCheck(true, false); }
+void Manager::CheckNow(bool requiredByPeer) {
+  StartCheck(true, requiredByPeer);
+}
 
-void Manager::CheckWorker(bool manual, bool requiredByPeer) {
-  std::vector<uint8_t> manifestBytes;
-  std::vector<uint8_t> signatureText;
-  std::vector<uint8_t> signature;
-  Manifest parsed;
-  bool ok = HttpGet(manifestUrl_, kMaximumManifestBytes, manifestBytes,
-                    &cancel_) &&
-            HttpGet(manifestUrl_ + ".sig", 4096U, signatureText, &cancel_) &&
-            DecodeBase64(std::string(signatureText.begin(), signatureText.end()),
-                         signature) &&
-            VerifyManifestSignature(manifestBytes, signature) &&
-            ParseManifest(manifestBytes, parsed);
-  if (cancel_.load()) {
-    workerRunning_.store(false);
-    return;
+void Manager::CheckWorker() {
+  WorkerCompletion finished{workerRunning_};
+  try {
+    std::vector<uint8_t> manifestBytes;
+    std::vector<uint8_t> signatureText;
+    std::vector<uint8_t> signature;
+    Manifest parsed;
+    const bool ok = HttpGet(manifestUrl_, kMaximumManifestBytes, manifestBytes,
+                            &cancel_) &&
+        HttpGet(manifestUrl_ + ".sig", 4096U, signatureText, &cancel_) &&
+        DecodeBase64(std::string(signatureText.begin(), signatureText.end()),
+                     signature) &&
+        VerifyManifestSignature(manifestBytes, signature) &&
+        ParseManifest(manifestBytes, parsed);
+    if (cancel_.load()) return;
+    if (!ok) {
+      SetError(L"无法验证更新信息，请稍后重试。");
+      return;
+    }
+    PublishCheckResult(parsed);
+  } catch (...) {
+    SetError(L"更新检查未完成，请稍后重试。");
   }
-  if (!ok) {
-    SetError(L"无法验证更新信息，请稍后重试。", manual);
-    workerRunning_.store(false);
-    return;
-  }
+}
+
+void Manager::PublishCheckResult(const Manifest &parsed) {
   const std::string current = plane_pet_version::kString;
   const bool newer = CompareVersion(current, parsed.version) < 0;
   const bool belowMinimum = CompareVersion(current, parsed.minimumVersion) < 0;
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    // Dismiss uses this same lock: a result cannot overwrite a closed prompt.
+    if (cancel_.load() || snapshot_.state != State::Checking) return;
+    const bool requiredByPeer = snapshot_.required;
     manifest_ = parsed;
     snapshot_.latestVersion = Wide(parsed.version);
     for (size_t index = 0; index < 3; ++index)
       snapshot_.summary[index] = parsed.summary[index];
-    snapshot_.manual = manual;
     snapshot_.required = requiredByPeer || belowMinimum;
+    snapshot_.canDownload = newer;
     if (newer) {
       snapshot_.state = snapshot_.required ? State::Required
                                            : State::Available;
@@ -512,7 +588,7 @@ void Manager::CheckWorker(bool manual, bool requiredByPeer) {
           : L"发现新版本";
     } else if (requiredByPeer) {
       snapshot_.state = State::Required;
-      snapshot_.message = L"好友使用了不同的大版本，但更新暂未发布";
+      snapshot_.message = L"好友大版本不同，暂无可用更新";
     } else {
       snapshot_.state = State::Current;
       snapshot_.message = L"当前已是最新版本";
@@ -520,91 +596,130 @@ void Manager::CheckWorker(bool manual, bool requiredByPeer) {
     ++snapshot_.generation;
   }
   PostMessageW(owner_, kChangedMessage, 0, 0);
-  workerRunning_.store(false);
 }
 
-void Manager::AcceptAndDownload() {
+bool Manager::AcceptAndDownload() {
   JoinFinishedWorker();
-  if (workerRunning_.exchange(true)) return;
+  if (workerRunning_.load()) return false;
   Manifest selected;
   {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (snapshot_.state != State::Available &&
-        snapshot_.state != State::Required) {
-      workerRunning_.store(false);
-      return;
-    }
+    if ((snapshot_.state != State::Available &&
+         snapshot_.state != State::Required) || !snapshot_.canDownload ||
+        CompareVersion(plane_pet_version::kString, manifest_.version) >= 0)
+      return false;
     selected = manifest_;
     snapshot_.state = State::Downloading;
     snapshot_.message = L"正在下载更新…";
     snapshot_.progressPercent = 0;
+    snapshot_.canDownload = false;
+    downloadProgress_.store(0);
+    installRequestReady_.store(false);
+    cancel_.store(false);
     ++snapshot_.generation;
   }
-  cancel_.store(false);
+  workerRunning_.store(true);
   PostMessageW(owner_, kChangedMessage, 0, 0);
-  worker_ = std::thread(&Manager::DownloadWorker, this, selected);
+  try {
+    worker_ = std::thread(&Manager::DownloadWorker, this, selected);
+  } catch (...) {
+    SetError(L"无法启动更新下载，请稍后重试。");
+    workerRunning_.store(false);
+    return false;
+  }
+  return true;
 }
 
 void Manager::DownloadWorker(Manifest manifest) {
-  std::vector<uint8_t> bytes;
-  const bool downloaded =
-      HttpGet(manifest.artifactUrl,
-              static_cast<size_t>(std::min<uint64_t>(
-                  kMaximumArtifactBytes, manifest.size + 1ULL)),
-              bytes, &cancel_, &downloadProgress_) &&
-      bytes.size() == manifest.size;
-  std::array<uint8_t, 32> digest{};
-  if (cancel_.load()) {
-    workerRunning_.store(false);
-    return;
+  WorkerCompletion finished{workerRunning_};
+  try {
+    std::vector<uint8_t> bytes;
+    const bool downloaded =
+        HttpGet(manifest.artifactUrl,
+                static_cast<size_t>(std::min<uint64_t>(
+                    kMaximumArtifactBytes, manifest.size + 1ULL)),
+                bytes, &cancel_, &downloadProgress_) &&
+        bytes.size() == manifest.size;
+    std::array<uint8_t, 32> digest{};
+    if (cancel_.load()) return;
+    if (!downloaded || !Sha256(bytes.data(), bytes.size(), digest) ||
+        Hex(digest) != manifest.sha256) {
+      SetError(L"更新包校验失败，未安装任何文件。");
+      return;
+    }
+    if (cancel_.load()) return;
+    const std::filesystem::path package =
+        requestPath_.parent_path() / L"updates" / Wide(manifest.version) /
+        L"PlanePet.exe.download";
+    if (!WriteBytesAtomically(package, bytes)) {
+      SetError(L"无法保存更新包，请检查磁盘空间和安全软件。");
+      return;
+    }
+    PublishInstallRequest(manifest, package);
+  } catch (...) {
+    SetError(L"更新下载未完成，当前版本保持不变。");
   }
-  if (!downloaded || !Sha256(bytes.data(), bytes.size(), digest) ||
-      Hex(digest) != manifest.sha256) {
-    SetError(L"更新包校验失败，未安装任何文件。", true);
-    workerRunning_.store(false);
-    return;
-  }
-  const std::filesystem::path package =
-      requestPath_.parent_path() / L"updates" / Wide(manifest.version) /
-      L"PlanePet.exe.download";
-  if (!WriteBytesAtomically(package, bytes)) {
-    SetError(L"无法保存更新包，请检查磁盘空间和安全软件。", true);
-    workerRunning_.store(false);
-    return;
-  }
+}
+
+void Manager::PublishInstallRequest(const Manifest &manifest,
+                                    const std::filesystem::path &package) {
   const std::wstring requestText =
       L"PLANE_PET_UPDATE 1\n" + Wide(manifest.version) + L"\n" +
       Wide(manifest.sha256) + L"\n" + package.wstring() + L"\n";
   const std::string requestUtf8 = Utf8(requestText);
   const std::vector<uint8_t> requestBytes(requestUtf8.begin(),
                                           requestUtf8.end());
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (cancel_.load() || snapshot_.state != State::Downloading) return;
   if (requestUtf8.empty() ||
       !WriteBytesAtomically(requestPath_, requestBytes)) {
-    SetError(L"无法创建安装请求，当前版本保持不变。", true);
-    workerRunning_.store(false);
+    lock.unlock();
+    SetError(L"无法创建安装请求，当前版本保持不变。");
     return;
   }
   installRequestReady_.store(true);
   downloadProgress_.store(100);
-  workerRunning_.store(false);
+  snapshot_.message = L"下载完成，返回待机后安装…";
+  ++snapshot_.generation;
   PostMessageW(owner_, kInstallMessage, 0, 0);
 }
 
-void Manager::SetError(const std::wstring &message, bool manual) {
+void Manager::ReportInstallFailure(const std::wstring &message) {
+  if (!Enabled()) return;
+  cancel_.store(false);
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    snapshot_.manual = true;
+  }
+  nextAutomaticCheckMs_ = UnixTimeMillis() + 24ULL * 60 * 60 * 1000;
+  SetError(message);
+}
+
+void Manager::SetError(const std::wstring &message) {
   std::lock_guard<std::mutex> lock(mutex_);
+  if (cancel_.load() || (snapshot_.state != State::Checking &&
+                         snapshot_.state != State::Downloading)) return;
+  if (snapshot_.state == State::Downloading) snapshot_.manual = true;
   snapshot_.state = State::Error;
   snapshot_.message = message;
-  snapshot_.manual = manual;
+  snapshot_.canDownload = false;
   ++snapshot_.generation;
   PostMessageW(owner_, kChangedMessage, 0, 0);
 }
 
 void Manager::Dismiss() {
-  cancel_.store(true);
   std::lock_guard<std::mutex> lock(mutex_);
-  if (snapshot_.state != State::Disabled) snapshot_.state = State::Idle;
-  snapshot_.message.clear();
-  ++snapshot_.generation;
+  cancel_.store(true);
+  installRequestReady_.store(false);
+  pendingManualCheck_ = pendingRequiredCheck_ = false;
+  const State state = snapshot_.state == State::Disabled
+      ? State::Disabled : State::Idle;
+  const uint64_t generation = snapshot_.generation;
+  snapshot_ = Snapshot{};
+  snapshot_.currentVersion = plane_pet_version::kWideString;
+  snapshot_.state = state;
+  snapshot_.generation = generation + 1;
+  nextAutomaticCheckMs_ = UnixTimeMillis() + 24ULL * 60 * 60 * 1000;
 }
 
 void Manager::SetOptionalSnoozeUntil(uint64_t unixTimeMs) {

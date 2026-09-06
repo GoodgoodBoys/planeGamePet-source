@@ -4,11 +4,13 @@
 import asyncio
 import base64
 import contextlib
+import concurrent.futures
 import datetime as dt
 import hashlib
 import hmac
 import html
 import json
+import ipaddress
 import logging
 import os
 import socket
@@ -46,7 +48,9 @@ ADMIN_PASSWORD = load_admin_password()
 MAX_CONNECTIONS = int(os.environ.get("PLANE_PET_MAX_CONNECTIONS", "128"))
 MAX_ENROLLMENTS = int(os.environ.get("PLANE_PET_MAX_ENROLLMENTS", "1000"))
 MAX_ENROLLMENTS_PER_IP = int(os.environ.get(
-    "PLANE_PET_MAX_ENROLLMENTS_PER_IP", "8"))
+    "PLANE_PET_MAX_ENROLLMENTS_PER_IP", "64"))
+ENROLLMENT_WINDOW_SECONDS = 3600
+MAX_CONNECTIONS_PER_INSTALL = 2
 MAX_FRAME = 4096
 MAX_TELEMETRY_FRAME = 768
 MAX_TELEMETRY_EVENTS_PER_MINUTE = 240
@@ -76,12 +80,15 @@ ALLOWED_EVENTS = frozenset({
     "update_install_failed", "update_rollback",
     "peer_version_mismatch", "peer_version_compatible",
     "forced_update_required",
+    "usage_started", "usage_heartbeat", "usage_ended",
 })
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 active_connections = 0
+active_installations = {}
 active_lock = asyncio.Lock()
 telemetry_db = None
+telemetry_service = None
 last_telemetry_prune = 0.0
 
 
@@ -122,11 +129,12 @@ def token_digest(authorization: str):
     return hashlib.sha256(token.encode("ascii")).hexdigest()
 
 
-def persist_tokens() -> None:
+def persist_tokens(tokens=None) -> None:
+    tokens = TOKENS if tokens is None else tokens
     TOKEN_STORE.parent.mkdir(parents=True, exist_ok=True)
     temporary = TOKEN_STORE.with_suffix(".tmp")
     with temporary.open("w", encoding="ascii", newline="\n") as output:
-        for digest, (created, address) in sorted(TOKENS.items()):
+        for digest, (created, address) in sorted(tokens.items()):
             output.write(f"{digest} {created} {address}\n")
         output.flush()
         os.fsync(output.fileno())
@@ -140,10 +148,11 @@ if TOKENS_NEED_REWRITE:
 
 def open_telemetry_store(path: Path = TELEMETRY_STORE):
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path, timeout=5)
+    connection = sqlite3.connect(path, timeout=0.2)
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=NORMAL")
-    connection.execute("PRAGMA busy_timeout=5000")
+    connection.execute("PRAGMA busy_timeout=200")
+    connection.execute("PRAGMA secure_delete=ON")
     connection.executescript("""
         CREATE TABLE IF NOT EXISTS telemetry_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -189,7 +198,7 @@ def parse_telemetry(payload: bytes):
     event_id = item.get("q")
     client_at = item.get("t")
     value = item.get("x")
-    if (event not in ALLOWED_EVENTS or not isinstance(version, str) or
+    if (not isinstance(event, str) or event not in ALLOWED_EVENTS or not isinstance(version, str) or
             not version or len(version) > 16 or
             any(ch not in "0123456789." for ch in version) or
             not isinstance(event_id, int) or isinstance(event_id, bool) or
@@ -224,15 +233,33 @@ def store_telemetry(digest: str, payload: bytes, received_at_ms=None) -> bool:
         telemetry_db.commit()
         inserted = cursor.rowcount == 1
     except sqlite3.Error:
+        telemetry_db.rollback()
         logging.exception("telemetry database write failed")
         return False
-    if time.monotonic() - last_telemetry_prune > 86400:
+    prune_telemetry(now_ms)
+    return inserted
+
+
+def prune_telemetry(now_ms=None, force=False) -> bool:
+    global last_telemetry_prune
+    if telemetry_db is None:
+        return False
+    if not force and time.monotonic() - last_telemetry_prune < 60:
+        return True
+    now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    try:
         cutoff = now_ms - TELEMETRY_RETENTION_DAYS * 86400000
-        telemetry_db.execute(
+        cursor = telemetry_db.execute(
             "DELETE FROM telemetry_events WHERE received_at_ms < ?", (cutoff,))
         telemetry_db.commit()
+        if cursor.rowcount:
+            telemetry_db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         last_telemetry_prune = time.monotonic()
-    return inserted
+        return True
+    except sqlite3.Error:
+        telemetry_db.rollback()
+        logging.exception("telemetry retention cleanup failed")
+        return False
 
 
 def _count(event: str) -> int:
@@ -265,26 +292,45 @@ def _format_duration(milliseconds: int) -> str:
 
 def analytics_snapshot(now_ms=None):
     now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+    if not prune_telemetry(now_ms, force=True):
+        raise sqlite3.OperationalError("retention cleanup unavailable")
     sessions = telemetry_db.execute(
         """SELECT MIN(received_at_ms), MAX(received_at_ms),
-                  MAX(CASE WHEN event='app_exited' THEN value END)
+                  MAX(CASE WHEN event IN ('usage_started','usage_heartbeat','usage_ended')
+                           THEN value END)
            FROM telemetry_events GROUP BY installation_id, session_id""").fetchall()
     durations = []
-    for first, last, reported in sessions:
-        observed = max(0, min(int(last) - int(first), 24 * 3600000))
-        if reported is not None and 0 <= int(reported) <= 24 * 3600000:
-            observed = max(observed, int(reported))
+    duration_cap = TELEMETRY_RETENTION_DAYS * 86400000
+    for first, last, enabled_usage in sessions:
+        if enabled_usage is not None:
+            observed = max(0, min(int(enabled_usage), duration_cap))
+        else:
+            # Legacy clients lack consent segment counters. Never extrapolate
+            # backwards to a process start that predates their consent.
+            observed = max(0, min(int(last) - int(first), duration_cap))
         durations.append(observed)
     total_usage = sum(durations)
     median_usage = int(statistics.median(durations)) if durations else 0
-    games_started = _distinct("round_id", "game_started")
-    games_completed = _distinct("round_id", "game_finished")
+    started_rounds = {row[0] for row in telemetry_db.execute(
+        """SELECT DISTINCT round_id FROM telemetry_events
+           WHERE event IN ('game_countdown','game_started')
+             AND round_id!='0000000000000000'""")}
+    playing_rounds = {row[0] for row in telemetry_db.execute(
+        "SELECT DISTINCT round_id FROM telemetry_events WHERE event='game_started'")}
+    finished_rounds = {row[0] for row in telemetry_db.execute(
+        "SELECT DISTINCT round_id FROM telemetry_events WHERE event='game_finished'")}
+    completed_rounds = started_rounds & finished_rounds
+    games_started = len(started_rounds)
+    games_completed = len(completed_rounds)
     invites = _distinct("invite_id", "invite_waiting")
     accepted = _distinct("invite_id", "invite_accepted_by_peer")
-    game_durations = [int(row[0]) for row in telemetry_db.execute(
-        """SELECT MAX(value) FROM telemetry_events
+    game_durations = [(int(value) if round_id in playing_rounds else 0)
+                      for round_id, value in telemetry_db.execute(
+        """SELECT round_id, MAX(value) FROM telemetry_events
            WHERE event='game_finished' AND round_id!='0000000000000000'
-           GROUP BY round_id""").fetchall() if row[0] is not None]
+           GROUP BY round_id""").fetchall()
+                      if round_id in completed_rounds and value is not None
+                      and (round_id not in playing_rounds or 0 <= int(value) <= 180000)]
 
     daily_rows = telemetry_db.execute(
         """SELECT received_at_ms, installation_id, session_id, event, round_id
@@ -302,7 +348,7 @@ def analytics_snapshot(now_ms=None):
             "sessions": len({(row[1], row[2]) for row in rows}),
             "games": len({row[4] for row in rows
                           if row[3] == "game_finished" and
-                          row[4] != "0000000000000000"}),
+                          row[4] in completed_rounds}),
         })
 
     recent = []
@@ -410,7 +456,7 @@ def render_admin_page() -> bytes:
 <section><h2>邀请结果</h2><p>接受 {data['accepted']} · 拒绝 {data['rejected']} · 超时 {data['timed_out']} · 胜局 {data['wins']} · 平局 {data['draws']}</p></section>
 <section><h2>快捷表情</h2><p>发送 {data['emotes_sent']} · 好友端收到 {data['emotes_received']} · 使用人数 {data['emote_users']}</p><p>{emote_html}</p></section>
 <section><h2>最近匿名事件</h2><table><thead><tr><th>时间</th><th>匿名安装</th><th>事件</th><th>数值</th><th>版本</th></tr></thead><tbody>{recent_html}</tbody></table></section>
-<section class="note">仅统计明确同意上传的客户端。使用时长由启动、60 秒心跳及正常退出事件估算；异常断电可能产生少量误差。原始匿名事件保留 {TELEMETRY_RETENTION_DAYS} 天。不采集匹配码、姓名、键鼠轨迹、屏幕内容或窗口标题。</section>
+<section class="note">仅统计明确同意上传的客户端。新版使用时长只累计启用统计期间，由 60 秒心跳及停止/退出事件估算；旧版按实际收到事件的时间范围估算。异常断电可能产生少量误差。开始对局包括已接受邀请的倒数，倒数中断的战斗时长为 0；完成率只计算有开局记录的对局。原始匿名事件保留 {TELEMETRY_RETENTION_DAYS} 天，过期不再展示，每分钟自动清理。不采集匹配码、姓名、键鼠轨迹、屏幕内容或窗口标题。</section>
 </div></body></html>"""
     return document.encode("utf-8")
 
@@ -445,12 +491,19 @@ async def read_request(reader: asyncio.StreamReader):
     for line in lines[1:]:
         if line and ":" in line:
             name, value = line.split(":", 1)
-            headers[name.strip().lower()] = value.strip()
+            key = name.strip().lower()
+            if key in headers:
+                raise ValueError("duplicate request header")
+            headers[key] = value.strip()
     return method, path.split("?", 1)[0], headers
 
 
 async def read_frame(reader: asyncio.StreamReader):
-    first, second = await asyncio.wait_for(reader.readexactly(2), timeout=90)
+    return await asyncio.wait_for(_read_frame(reader), timeout=90)
+
+
+async def _read_frame(reader: asyncio.StreamReader):
+    first, second = await reader.readexactly(2)
     if first & 0x70:
         raise ValueError("reserved WebSocket bits are set")
     final, opcode, masked = bool(first & 0x80), first & 0x0F, bool(second & 0x80)
@@ -463,6 +516,8 @@ async def read_frame(reader: asyncio.StreamReader):
         length = struct.unpack("!Q", await reader.readexactly(8))[0]
     if length > MAX_FRAME:
         raise ValueError("WebSocket frame is too large")
+    if opcode >= 8 and (not final or length > 125):
+        raise ValueError("invalid control frame")
     mask = await reader.readexactly(4)
     payload = bytearray(await reader.readexactly(length))
     for index in range(length):
@@ -491,6 +546,7 @@ async def bridge(reader, writer, installation_digest: str) -> None:
     udp.connect((UDP_HOST, UDP_PORT))
     write_lock = asyncio.Lock()
     telemetry_times = []
+    game_times = []
 
     async def websocket_to_udp():
         while True:
@@ -504,9 +560,14 @@ async def bridge(reader, writer, installation_digest: str) -> None:
                                           if now - stamp < 60]
                     if len(telemetry_times) < MAX_TELEMETRY_EVENTS_PER_MINUTE:
                         telemetry_times.append(now)
-                        store_telemetry(installation_digest, payload)
+                        if telemetry_service is not None:
+                            telemetry_service.enqueue(installation_digest, payload)
                 elif payload:
-                    await loop.sock_sendall(udp, payload)
+                    now = time.monotonic()
+                    game_times[:] = [stamp for stamp in game_times if now - stamp < 1]
+                    if len(game_times) < 200:
+                        game_times.append(now)
+                        await loop.sock_sendall(udp, payload)
             elif opcode == 0x8:
                 return
             elif opcode == 0x9:
@@ -545,9 +606,12 @@ async def handle_client(reader, writer) -> None:
     counted = False
     try:
         method, path, headers = await read_request(reader)
-        forwarded = headers.get("x-forwarded-for", "").split(",", 1)[0].strip()
-        if forwarded:
-            client_ip = forwarded
+        # Only the loopback proxy is trusted. The rightmost value is safe with
+        # both the previous append and the new overwrite Nginx configuration.
+        if peer and ipaddress.ip_address(peer[0]).is_loopback:
+            forwarded = headers.get("x-forwarded-for", "").rsplit(",", 1)[-1].strip()
+            if forwarded:
+                client_ip = str(ipaddress.ip_address(forwarded))
         if method == "GET" and path == "/healthz":
             await send_http(writer, "200 OK", b"ok\n")
             return
@@ -558,8 +622,14 @@ async def handle_client(reader, writer) -> None:
                 await send_http(writer, "401 Unauthorized", b"authentication required\n",
                                 extra_headers=('WWW-Authenticate: Basic realm="Plane Pet Analytics", charset="UTF-8"',))
             else:
-                await send_http(writer, "200 OK", render_admin_page(),
-                                "text/html; charset=utf-8")
+                try:
+                    page = await telemetry_service.admin_page() if telemetry_service else None
+                    if page is None:
+                        raise RuntimeError("analytics worker unavailable")
+                    await send_http(writer, "200 OK", page, "text/html; charset=utf-8")
+                except Exception:
+                    logging.exception("analytics page unavailable")
+                    await send_http(writer, "503 Service Unavailable", b"analytics temporarily unavailable\n")
             return
         if method != "GET" or path != "/v1/tunnel":
             await send_http(writer, "404 Not Found", b"not found\n")
@@ -568,31 +638,46 @@ async def handle_client(reader, writer) -> None:
         if digest is None:
             await send_http(writer, "401 Unauthorized", b"unauthorized\n")
             return
+        key = headers.get("sec-websocket-key", "")
+        try:
+            valid_key = len(base64.b64decode(key.encode("ascii"), validate=True)) == 16
+        except (ValueError, UnicodeError):
+            valid_key = False
+        if (headers.get("upgrade", "").lower() != "websocket" or
+                "upgrade" not in {part.strip().lower() for part in headers.get("connection", "").split(",")} or
+                headers.get("sec-websocket-version") != "13" or not valid_key):
+            await send_http(writer, "400 Bad Request", b"valid WebSocket upgrade required\n")
+            return
         async with active_lock:
+            if (active_connections >= MAX_CONNECTIONS or
+                    active_installations.get(digest, 0) >= MAX_CONNECTIONS_PER_INSTALL):
+                await send_http(writer, "503 Service Unavailable", b"connection limit\n")
+                return
             known = any(hmac.compare_digest(digest, stored) for stored in TOKENS)
             if not known:
                 client_bucket = address_bucket(client_ip)
-                enrolled_from_ip = sum(1 for _, address in TOKENS.values()
-                                       if hmac.compare_digest(address,
-                                                              client_bucket))
+                now_seconds = int(time.time())
+                enrolled_from_ip = sum(1 for created, address in TOKENS.values()
+                                       if str(created).isdigit() and
+                                       now_seconds - int(created) < ENROLLMENT_WINDOW_SECONDS and
+                                       hmac.compare_digest(address, client_bucket))
                 if (headers.get("x-plane-pet-enroll") != "1" or
                         len(TOKENS) >= MAX_ENROLLMENTS or
                         enrolled_from_ip >= MAX_ENROLLMENTS_PER_IP):
                     await send_http(writer, "403 Forbidden", b"enrollment denied\n")
                     return
-                TOKENS[digest] = (str(int(time.time())), client_bucket)
-                persist_tokens()
+                updated = dict(TOKENS)
+                updated[digest] = (str(now_seconds), client_bucket)
+                try:
+                    await asyncio.get_running_loop().run_in_executor(None, persist_tokens, updated)
+                except OSError:
+                    await send_http(writer, "503 Service Unavailable", b"credential store unavailable\n")
+                    return
+                TOKENS[digest] = updated[digest]
                 logging.info("credential enrolled install=%s total=%d",
                              digest[:8], len(TOKENS))
-        key = headers.get("sec-websocket-key", "")
-        if headers.get("upgrade", "").lower() != "websocket" or not key:
-            await send_http(writer, "400 Bad Request", b"upgrade required\n")
-            return
-        async with active_lock:
-            if active_connections >= MAX_CONNECTIONS:
-                await send_http(writer, "503 Service Unavailable", b"busy\n")
-                return
             active_connections += 1
+            active_installations[digest] = active_installations.get(digest, 0) + 1
             counted = True
         accept = base64.b64encode(hashlib.sha1(
             (key + WEBSOCKET_MAGIC).encode("ascii")).digest())
@@ -612,20 +697,106 @@ async def handle_client(reader, writer) -> None:
         if counted:
             async with active_lock:
                 active_connections -= 1
+                remaining = active_installations.get(digest, 1) - 1
+                if remaining:
+                    active_installations[digest] = remaining
+                else:
+                    active_installations.pop(digest, None)
         writer.close()
         with contextlib.suppress(Exception):
             await writer.wait_closed()
 
 
+class TelemetryService:
+    """One SQLite owner thread and a bounded queue isolate game forwarding."""
+    def __init__(self, path=TELEMETRY_STORE, queue_size=2048):
+        self.path = path
+        self.queue = asyncio.Queue(maxsize=queue_size)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.tasks = []
+        self.page_lock = asyncio.Lock()
+        self.cached_page = None
+        self.cached_at = 0.0
+        self.dropped = 0
+
+    async def run_db(self, function, *args):
+        return await asyncio.get_running_loop().run_in_executor(self.executor, function, *args)
+
+    def open_db(self):
+        global telemetry_db
+        telemetry_db = open_telemetry_store(self.path)
+        if not prune_telemetry(force=True):
+            logging.warning("initial retention cleanup deferred")
+
+    async def start(self):
+        await self.run_db(self.open_db)
+        self.tasks = [asyncio.create_task(self.consume()), asyncio.create_task(self.cleanup())]
+
+    def enqueue(self, digest, payload):
+        if parse_telemetry(payload) is None:
+            return False
+        try:
+            self.queue.put_nowait((digest, payload))
+            return True
+        except asyncio.QueueFull:
+            self.dropped += 1
+            return False
+
+    async def consume(self):
+        while True:
+            event = await self.queue.get()
+            try:
+                await self.run_db(store_telemetry, *event)
+            except Exception:
+                logging.exception("isolated telemetry write failed")
+            finally:
+                self.queue.task_done()
+
+    async def cleanup(self):
+        while True:
+            await asyncio.sleep(60)
+            try:
+                await self.run_db(prune_telemetry, None, True)
+            except Exception:
+                logging.exception("isolated retention task failed")
+
+    async def admin_page(self):
+        async with self.page_lock:
+            if self.cached_page is None or time.monotonic() - self.cached_at >= 5:
+                self.cached_page = await self.run_db(render_admin_page)
+                self.cached_at = time.monotonic()
+            return self.cached_page
+
+    async def stop(self):
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self.queue.join(), timeout=3)
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        if telemetry_db is not None:
+            await self.run_db(telemetry_db.close)
+        self.executor.shutdown(wait=False)
+
+
 async def main() -> None:
-    global telemetry_db
-    telemetry_db = open_telemetry_store()
+    global telemetry_service
+    service = TelemetryService()
+    try:
+        await service.start()
+        telemetry_service = service
+    except Exception:
+        logging.exception("analytics disabled; game gateway remains available")
+        service.executor.shutdown(wait=False)
     server = await asyncio.start_server(handle_client, LISTEN_HOST, LISTEN_PORT)
     logging.info("gateway ready address=%s:%d udp=%s:%d analytics=%s",
                  LISTEN_HOST, LISTEN_PORT, UDP_HOST, UDP_PORT,
                  "enabled" if ADMIN_PASSWORD else "collection-only")
-    async with server:
-        await server.serve_forever()
+    try:
+        async with server:
+            await server.serve_forever()
+    finally:
+        if telemetry_service is not None:
+            await telemetry_service.stop()
 
 
 if __name__ == "__main__":

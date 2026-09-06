@@ -8,7 +8,9 @@
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dist = Join-Path $root "dist"
-$appVersion = "1.0.0"
+$versionHeader = Get-Content -Raw -LiteralPath (Join-Path $root "common\app_version.h")
+if ($versionHeader -notmatch 'kString\[\] = "(\d+\.\d+\.\d+)"') { throw "Missing app version" }
+$appVersion = $Matches[1]
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 
 if (-not (Test-Path -LiteralPath $Compiler)) {

@@ -411,7 +411,7 @@ int RunStorageError(uint16_t port, uint32_t code) {
 bool HasCompatibility(const Peer &peer, uint8_t expectedFlags,
                       pcpair::AppVersion expectedPeer) {
   return peer.compatibilityMessages > 0 &&
-         peer.compatibilityFlags == expectedFlags &&
+         peer.compatibilityFlags == (expectedFlags | pcpair::ScopedActionsSupported) &&
          peer.peerAppVersion.major == expectedPeer.major &&
          peer.peerAppVersion.minor == expectedPeer.minor &&
          peer.peerAppVersion.patch == expectedPeer.patch;

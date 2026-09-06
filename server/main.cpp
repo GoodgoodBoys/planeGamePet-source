@@ -57,6 +57,7 @@ struct Binding {
   uint32_t tokenHigh[2]{};
   uint32_t pendingRequest[2]{};
   pcpair::AppVersion pendingVersion[2]{};
+  Clock::time_point provisionalDeadline{};
 };
 
 struct Waiter {
@@ -70,6 +71,7 @@ struct Waiter {
 
 struct SourceRate {
   uint32_t address = 0;
+  uint16_t port = 0;
   uint32_t packets = 0;
   Clock::time_point windowStarted{};
   Clock::time_point lastSeen{};
@@ -83,6 +85,7 @@ struct Client {
   uint32_t lastSequence = 0;
   uint32_t lastInputSequence = 0;
   uint32_t resumeRequestId = 0;
+  uint32_t lastOperationId = 0;
   uint8_t slot = 0;
   uint8_t input = 0;
   Clock::time_point lastSeen{};
@@ -106,6 +109,12 @@ struct Room {
 
 struct UnboundTombstone {
   Binding binding{};
+  Clock::time_point expires{};
+};
+
+struct CancelledRequest {
+  uint32_t deviceId = 0;
+  uint32_t requestId = 0;
   Clock::time_point expires{};
 };
 
@@ -317,7 +326,7 @@ class PetServer {
       if (room.bindingId == bindingId) return room;
     Room room;
     room.bindingId = bindingId;
-    room.phaseStarted = room.matchStarted = Clock::now();
+    room.phaseStarted = Clock::now();
     plink::InitializeWorld(room.world);
     rooms_.push_back(room);
     return rooms_.back();
@@ -369,6 +378,8 @@ class PetServer {
           return false;
         }
       }
+      if (binding.pendingRequest[0] != 0 || binding.pendingRequest[1] != 0)
+        binding.provisionalDeadline = Clock::now() + std::chrono::seconds(60);
       loaded.push_back(binding);
       binding = Binding{};
     }
@@ -452,6 +463,7 @@ class PetServer {
     response.deviceId = request.deviceId;
     response.requestId = request.requestId;
     response.pairingCode = request.pairingCode;
+    response.bindingId = request.bindingId;
     response.status = status;
     SendControl(endpoint, response);
   }
@@ -477,8 +489,9 @@ class PetServer {
 
   static uint8_t CompatibilityFlags(const pcpair::AppVersion &local,
                                     const pcpair::AppVersion &peer) {
-    if (!peer.Known()) return 0;
-    uint8_t flags = pcpair::PeerVersionKnown;
+    uint8_t flags = pcpair::ScopedActionsSupported;
+    if (!peer.Known()) return flags;
+    flags |= pcpair::PeerVersionKnown;
     if (local.Known()) {
       const auto localTuple =
           std::array<uint8_t, 3>{local.major, local.minor, local.patch};
@@ -530,6 +543,13 @@ class PetServer {
 
   void HandlePairStart(const sockaddr_in &endpoint,
                        const pcpair::Message &message) {
+    for (const auto &cancelled : cancelledRequests_) {
+      if (cancelled.deviceId == message.deviceId &&
+          cancelled.requestId == message.requestId && cancelled.expires > Clock::now()) {
+        SendStatus(endpoint, message, pcpair::Status::Cancelled);
+        return;
+      }
+    }
     if (message.deviceId == 0 || message.requestId == 0 ||
         message.pairingCode == 0 || message.pairingCode > 999999U) {
       SendStatus(endpoint, message, pcpair::Status::Invalid);
@@ -592,6 +612,7 @@ class PetServer {
     binding.pendingRequest[1] = message.requestId;
     binding.pendingVersion[0] = first.appVersion;
     binding.pendingVersion[1] = message.appVersion;
+    binding.provisionalDeadline = Clock::now() + std::chrono::seconds(60);
     bindings_.push_back(binding);
     if (!SaveBindings()) {
       bindings_.pop_back();
@@ -614,8 +635,28 @@ class PetServer {
   }
 
   void HandlePairCancel(const sockaddr_in &endpoint,
-                        const pcpair::Message &message) {
+                         const pcpair::Message &message) {
+    if (message.deviceId == 0 || message.requestId == 0) {
+      SendStatus(endpoint, message, pcpair::Status::Invalid);
+      return;
+    }
+    // A match isn't permanent until both clients have durably saved its
+    // credentials and resumed. Cancel must also revoke this provisional pair.
+    if (Binding *binding = FindBindingByDevice(message.deviceId)) {
+      const int slot = BindingSlot(*binding, message.deviceId);
+      if (slot >= 0 && binding->pendingRequest[slot] == message.requestId) {
+        pcpair::Message revoke = message;
+        revoke.bindingId = binding->id;
+        revoke.tokenLow = binding->tokenLow[slot];
+        revoke.tokenHigh = binding->tokenHigh[slot];
+        HandleUnbind(endpoint, revoke);
+        if (FindBindingByDevice(message.deviceId) != nullptr) return;
+      }
+    }
     RemoveWaiter(message.deviceId, message.requestId);
+    cancelledRequests_.push_back(
+        {message.deviceId, message.requestId, Clock::now() + std::chrono::seconds(60)});
+    if (cancelledRequests_.size() > 4096) cancelledRequests_.erase(cancelledRequests_.begin());
     SendStatus(endpoint, message, pcpair::Status::Cancelled);
     std::printf("PAIR_CANCEL device=%u request=%u\n", message.deviceId,
                 message.requestId);
@@ -669,6 +710,8 @@ class PetServer {
       binding->pendingRequest[slot] = 0;
       if (!SaveBindings()) binding->pendingRequest[slot] = pendingRequest;
     }
+    if (binding->pendingRequest[0] == 0 && binding->pendingRequest[1] == 0)
+      binding->provisionalDeadline = Clock::time_point{};
     SendWelcome(client);
     if (!MajorVersionsCompatible(room) &&
         room.phase != plink::GamePhase::Menu) {
@@ -808,8 +851,12 @@ class PetServer {
                        }),
         sourceRates_.end());
     SourceRate *found = nullptr;
+    // Each authenticated WSS connection owns a distinct loopback UDP socket.
+    // Keep the per-IP limit for direct LAN traffic, but don't merge the gateway.
+    const uint16_t sourcePort =
+        (ntohl(endpoint.sin_addr.s_addr) >> 24U) == 127U ? endpoint.sin_port : 0;
     for (SourceRate &rate : sourceRates_) {
-      if (rate.address == endpoint.sin_addr.s_addr) {
+      if (rate.address == endpoint.sin_addr.s_addr && rate.port == sourcePort) {
         found = &rate;
         break;
       }
@@ -817,7 +864,7 @@ class PetServer {
     if (found == nullptr) {
       if (sourceRates_.size() >= 2048) return false;
       sourceRates_.push_back(
-          {endpoint.sin_addr.s_addr, 0, now, now});
+          {endpoint.sin_addr.s_addr, sourcePort, 0, now, now});
       found = &sourceRates_.back();
     }
     found->lastSeen = now;
@@ -831,7 +878,7 @@ class PetServer {
   }
 
   void ReceiveAll() {
-    for (;;) {
+    for (unsigned processed = 0; processed < 512; ++processed) {
       uint8_t bytes[pcpair::kMaxDatagramSize]{};
       sockaddr_in from{};
 #ifdef _WIN32
@@ -894,6 +941,23 @@ class PetServer {
         uint32_t sentAt = 0;
         plink::PayloadReader reader(payload, header.payloadLength);
         if (plink::ReadTimestamp(reader, sentAt)) SendPong(client, sentAt);
+      } else if (header.type == pcpair::kScopedActionPacketType) {
+        pcpair::ScopedAction action;
+        plink::PayloadReader reader(payload, header.payloadLength);
+        if (pcpair::ReadScopedAction(reader, action)) {
+          Room &room = *located.room;
+          if (action.operationId != client.lastOperationId &&
+              action.context.phase == room.phase &&
+              action.context.roundId == room.roundId &&
+              action.context.inviteId == room.inviteId) {
+            HandleAction(room, client, action.action);
+          }
+          client.lastOperationId = action.operationId;
+          uint8_t ackBytes[plink::kMaxPacketSize]{};
+          plink::PacketWriter ack(ackBytes, sizeof(ackBytes), pcpair::kActionAckPacketType,
+                                 client.session, ++serverSequence_, client.lastSequence, serverTick_);
+          if (ack.U32(action.operationId)) Send(client, ackBytes, ack.Finish());
+        }
       } else if (header.type == plink::PacketType::Action) {
         plink::ActionPayload action;
         plink::PayloadReader reader(payload, header.payloadLength);
@@ -923,6 +987,7 @@ class PetServer {
       room.endReason = plink::MatchEndReason::None;
       room.phase = plink::GamePhase::Countdown;
       room.phaseStarted = now;
+      room.matchStarted = Clock::time_point{};
     } else if (action == plink::PlayerAction::ReturnToMenu &&
                (room.phase == plink::GamePhase::Waiting ||
                 room.phase == plink::GamePhase::Finished)) {
@@ -1018,6 +1083,29 @@ class PetServer {
   void Tick() {
     ++serverTick_;
     const auto now = Clock::now();
+    cancelledRequests_.erase(
+        std::remove_if(cancelledRequests_.begin(), cancelledRequests_.end(),
+                       [now](const CancelledRequest &entry) { return now >= entry.expires; }),
+        cancelledRequests_.end());
+    std::vector<pcpair::Message> expiredPairs;
+    for (Binding &binding : bindings_) {
+      if (binding.provisionalDeadline.time_since_epoch().count() == 0 ||
+          now < binding.provisionalDeadline) continue;
+      for (int slot = 0; slot < 2; ++slot) {
+        if (binding.pendingRequest[slot] == 0) continue;
+        pcpair::Message cancel;
+        cancel.deviceId = binding.devices[slot];
+        cancel.requestId = binding.pendingRequest[slot];
+        expiredPairs.push_back(cancel);
+        binding.provisionalDeadline = now + std::chrono::seconds(5);
+        break;
+      }
+    }
+    for (const auto &cancel : expiredPairs) {
+      sockaddr_in noCaller{};
+      noCaller.sin_family = AF_INET;
+      HandlePairCancel(noCaller, cancel);
+    }
     const auto before = waiters_.size();
     waiters_.erase(
         std::remove_if(waiters_.begin(), waiters_.end(), [now](const Waiter &waiter) {
@@ -1097,8 +1185,9 @@ class PetServer {
           ? 0U : static_cast<uint32_t>(durationMs - elapsed);
     }
     uint32_t matchElapsedMs = 0;
-    if (room.phase == plink::GamePhase::Playing ||
-        room.phase == plink::GamePhase::Finished) {
+    if ((room.phase == plink::GamePhase::Playing ||
+         room.phase == plink::GamePhase::Finished) &&
+        room.matchStarted.time_since_epoch().count() != 0) {
       const auto end = room.phase == plink::GamePhase::Finished
                            ? room.phaseStarted
                            : now;
@@ -1163,6 +1252,7 @@ class PetServer {
   std::vector<SourceRate> sourceRates_;
   std::vector<Room> rooms_;
   std::vector<UnboundTombstone> unboundTombstones_;
+  std::vector<CancelledRequest> cancelledRequests_;
   uint32_t serverTick_ = 0;
   uint32_t serverSequence_ = 0;
   uint64_t invalidPackets_ = 0;

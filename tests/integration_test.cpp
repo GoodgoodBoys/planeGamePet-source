@@ -46,6 +46,8 @@ struct TestClient {
   uint32_t emoteCount = 0;
   plink::PlayerAction lastEmote = plink::PlayerAction::Invite;
   int lastSocketError = 0;
+  uint32_t controlErrors = 0;
+  uint8_t lastControlStatus = 0;
 };
 
 uint32_t NowMs(const Clock::time_point &start) {
@@ -166,12 +168,22 @@ void ReceiveAll(TestClient &client) {
       if (control.type == pcpair::MessageType::Status &&
           control.deviceId == client.clientId) {
         if (control.status == pcpair::Status::Matched) {
-          client.bindingId = control.bindingId;
-          client.tokenLow = control.tokenLow;
-          client.tokenHigh = control.tokenHigh;
+          // Compatibility-only Matched notices intentionally omit credentials.
+          // Keep the original matching credentials, as the desktop client does.
+          if (control.bindingId != 0 && control.tokenLow != 0 &&
+              control.tokenHigh != 0) {
+            client.bindingId = control.bindingId;
+            client.tokenLow = control.tokenLow;
+            client.tokenHigh = control.tokenHigh;
+          }
           client.assignedSlot = control.assignedSlot;
         } else if (control.status == pcpair::Status::Unbound) {
           client.unbound = true;
+        } else if (control.status == pcpair::Status::BindingMissing ||
+                   control.status == pcpair::Status::StorageError ||
+                   control.status == pcpair::Status::Invalid) {
+          ++client.controlErrors;
+          client.lastControlStatus = static_cast<uint8_t>(control.status);
         }
       }
       continue;
@@ -406,6 +418,7 @@ int main(int argc, char **argv) {
       sawPlaying = true;
       if (publicMode) {
         SendUnbind(alice);
+        nextAction = now + std::chrono::milliseconds(250);
         stage = Stage::WaitForUnbound;
       } else {
         stage = Stage::WaitForFinished;
@@ -428,10 +441,16 @@ int main(int argc, char **argv) {
         sawReturnedMenu = true;
         stage = Stage::Complete;
       }
-    } else if (stage == Stage::WaitForUnbound &&
-               alice.unbound && bob.unbound) {
-      sawUnbound = true;
-      stage = Stage::Complete;
+    } else if (stage == Stage::WaitForUnbound) {
+      if (alice.unbound && bob.unbound) {
+        sawUnbound = true;
+        stage = Stage::Complete;
+      } else if (now >= nextAction) {
+        // Mirror the real client's retries across the local UDP/WSS bridge.
+        if (!alice.unbound) SendUnbind(alice);
+        if (!bob.unbound) SendUnbind(bob);
+        nextAction = now + std::chrono::milliseconds(250);
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
@@ -462,6 +481,9 @@ int main(int argc, char **argv) {
       static_cast<unsigned long long>(bob.parseErrors),
       static_cast<unsigned long long>(alice.snapshotErrors),
       static_cast<unsigned long long>(bob.snapshotErrors));
+  std::printf("PC_PET_CONTROL_ERRORS count=%u:%u status=%u:%u\n",
+              alice.controlErrors, bob.controlErrors,
+              alice.lastControlStatus, bob.lastControlStatus);
   const bool commonSuccess = sawBothOnline && sawWaiting &&
       sawFiveMinuteInvite && sawCancelledMenu && sawCountdown && sawPlaying &&
       sawReplayRejected && sawEmote && survivingHitKeptPosition &&

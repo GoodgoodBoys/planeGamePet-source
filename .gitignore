@@ -40,6 +40,9 @@ __pycache__/
 *.key
 *.pfx
 *.p12
+*.csp
+*.credential
+*.credential.*
 gateway-admin.password
 
 # Temporary and backup files

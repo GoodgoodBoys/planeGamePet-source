@@ -15,6 +15,20 @@ constexpr WORD kTunnelResource = 201;
 constexpr WORD kClientResource = 202;
 constexpr WORD kUpdaterResource = 203;
 constexpr DWORD kUpdateInstallExitCode = 73;
+HANDLE gOwnedJob = nullptr;
+struct OwnedJob {
+  OwnedJob() {
+    gOwnedJob = CreateJobObjectW(nullptr, nullptr);
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (gOwnedJob && !SetInformationJobObject(gOwnedJob,
+        JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
+      CloseHandle(gOwnedJob);
+      gOwnedJob = nullptr;
+    }
+  }
+  ~OwnedJob() { if (gOwnedJob) CloseHandle(gOwnedJob); }
+};
 constexpr wchar_t kManifestUrl[] =
     L"https://egg-ota-test.oss-cn-beijing.aliyuncs.com/plane-pet/windows/stable/latest.json";
 
@@ -97,14 +111,27 @@ bool ExtractExecutable(WORD resourceId, const std::filesystem::path &target) {
 
 bool StartChild(const std::filesystem::path &executable,
                 const std::wstring &arguments, DWORD flags,
-                PROCESS_INFORMATION &process) {
+                PROCESS_INFORMATION &process, bool owned = false) {
   std::wstring command = Quote(executable.wstring()) + L" " + arguments;
   STARTUPINFOW startup{};
   startup.cb = sizeof(startup);
   process = PROCESS_INFORMATION{};
-  return CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE, flags,
+  if (owned && !gOwnedJob) return false;
+  if (!CreateProcessW(nullptr, command.data(), nullptr, nullptr, FALSE,
+                        flags | (owned ? CREATE_SUSPENDED : 0),
                         nullptr, executable.parent_path().c_str(), &startup,
-                        &process) != FALSE;
+                        &process)) return false;
+  if (owned) {
+    if (!AssignProcessToJobObject(gOwnedJob, process.hProcess) ||
+        ResumeThread(process.hThread) == static_cast<DWORD>(-1)) {
+      TerminateProcess(process.hProcess, 1);
+      CloseHandle(process.hThread);
+      CloseHandle(process.hProcess);
+      process = PROCESS_INFORMATION{};
+      return false;
+    }
+  }
+  return true;
 }
 
 void CloseProcessHandles(PROCESS_INFORMATION &process) {
@@ -160,6 +187,7 @@ bool WriteHealthMarker(const std::filesystem::path &data,
 }  // namespace
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+  OwnedJob ownedJob;
   HANDLE mutex = CreateMutexW(nullptr, TRUE, L"PlanePetPublicLauncher");
   if (mutex == nullptr) return 1;
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
@@ -190,9 +218,26 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
 
   PROCESS_INFORMATION tunnelProcess{};
   PROCESS_INFORMATION clientProcess{};
+  if (Option(L"complete-update").empty() &&
+      std::filesystem::is_regular_file(data / L"update.pending", error)) {
+    wchar_t modulePath[32768]{};
+    PROCESS_INFORMATION recovery{};
+    const bool started = GetModuleFileNameW(nullptr, modulePath,
+        static_cast<DWORD>(std::size(modulePath))) &&
+        StartChild(updater, L"--recover=1 --parent-pid=" +
+            std::to_wstring(GetCurrentProcessId()) + L" --target=" +
+            Quote(modulePath) + L" --data=" + Quote(data.wstring()),
+            CREATE_NO_WINDOW, recovery);
+    if (started) CloseProcessHandles(recovery);
+    else MessageBoxW(nullptr, L"无法启动升级恢复。原程序和备份均未改动，请重新解压安装包。",
+                     L"Plane Pet", MB_OK | MB_ICONERROR);
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    return started ? 0 : 5;
+  }
   const std::wstring tunnelArguments =
       L"--local-port=" + std::to_wstring(localPort);
-  if (!StartChild(tunnel, tunnelArguments, CREATE_NO_WINDOW, tunnelProcess)) {
+  if (!StartChild(tunnel, tunnelArguments, CREATE_NO_WINDOW, tunnelProcess, true)) {
     MessageBoxW(nullptr, L"无法启动加密联网隧道。", L"Plane Pet",
                 MB_OK | MB_ICONERROR);
     ReleaseMutex(mutex);
@@ -222,8 +267,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
       L" --update-enabled=1 --update-manifest=" + Quote(kManifestUrl) +
       L" --update-request=" + Quote(updateRequest) +
       (completedUpdate ? L" --update-installed=1" : L"") +
-      (rolledBackUpdate ? L" --update-rollback=1" : L"");
-  if (!StartChild(client, arguments, 0, clientProcess)) {
+      (rolledBackUpdate ? L" --update-rollback=1" : L"") +
+      (Option(L"update-failed") == L"1" ? L" --update-failed=1" : L"");
+  if (!StartChild(client, arguments, 0, clientProcess, true)) {
     StopOwnedProcess(tunnelProcess);
     MessageBoxW(nullptr, L"无法启动桌宠客户端。", L"Plane Pet",
                 MB_OK | MB_ICONERROR);

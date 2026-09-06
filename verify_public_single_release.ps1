@@ -1,10 +1,15 @@
 ﻿param(
     [string]$Archive = "",
-    [string]$ExpectedVersion = "1.0.0"
+    [string]$ExpectedVersion = ""
 )
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+if ([string]::IsNullOrWhiteSpace($ExpectedVersion)) {
+    $taskVersionHeader = Get-Content -Raw -LiteralPath (Join-Path $root 'common\app_version.h')
+    if ($taskVersionHeader -notmatch 'kString\[\] = "(\d+\.\d+\.\d+)"') { throw 'Missing app version' }
+    $ExpectedVersion = $Matches[1]
+}
 if ([string]::IsNullOrWhiteSpace($Archive)) {
     $Archive = Join-Path $root "dist\PlanePet-Public-Single-$ExpectedVersion.zip"
 }

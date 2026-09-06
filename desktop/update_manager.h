@@ -35,8 +35,12 @@ struct Snapshot {
   unsigned progressPercent = 0;
   bool manual = false;
   bool required = false;
+  bool canDownload = false;
   uint64_t generation = 0;
 };
+
+// Idle/Disabled are never prompts, even if stale intent flags are present.
+bool ShouldShowPrompt(const Snapshot &snapshot, bool petVisible);
 
 class Manager {
  public:
@@ -58,20 +62,28 @@ class Manager {
                  std::filesystem::path requestPath, bool enabled,
                  uint64_t optionalSnoozeUntilMs);
   void Tick(bool idleUiAvailable, bool peerVersionDiffers,
-            bool localUpdateAvailable, bool peerMajorMismatch);
-  void CheckNow();
-  void AcceptAndDownload();
+            bool localUpdateAvailable, bool peerMajorMismatch,
+            uint32_t peerVersionKey = 0);
+  void CheckNow(bool requiredByPeer = false);
+  bool AcceptAndDownload();
   void Dismiss();
   void SetOptionalSnoozeUntil(uint64_t unixTimeMs);
   Snapshot GetSnapshot() const;
   bool Enabled() const;
   bool HasInstallRequest() const;
+  void ReportInstallFailure(const std::wstring &message);
 
  private:
+#ifdef PLANE_PET_UPDATE_SELF_TEST
+  friend struct ManagerTestAccess;
+#endif
   void StartCheck(bool manual, bool requiredByPeer);
-  void CheckWorker(bool manual, bool requiredByPeer);
+  void CheckWorker();
+  void PublishCheckResult(const Manifest &manifest);
   void DownloadWorker(Manifest manifest);
-  void SetError(const std::wstring &message, bool manual);
+  void SetError(const std::wstring &message);
+  void PublishInstallRequest(const Manifest &manifest,
+                             const std::filesystem::path &package);
   void JoinFinishedWorker();
 
   HWND owner_ = nullptr;
@@ -88,6 +100,10 @@ class Manager {
   uint64_t optionalSnoozeUntilMs_ = 0;
   uint64_t nextAutomaticCheckMs_ = 0;
   bool peerRequirementHandled_ = false;
+  bool lastPeerMajorRequirement_ = false;
+  uint32_t lastPeerVersionKey_ = 0;
+  bool pendingManualCheck_ = false;
+  bool pendingRequiredCheck_ = false;
 };
 
 }  // namespace plane_pet_update

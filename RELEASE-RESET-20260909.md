@@ -4,7 +4,18 @@
 
 保留当前飞机/云/表情/受击素材、帮助与关于、勿扰、绑定与战绩、同步机制和已确认修复。不会为测试升级修改真实绑定、设置、战绩或统计。
 
-构建和本地验收已完成，GitHub 发布正在进行。OSS 网页自动化通道持续超时；Firefox 备用通道因不支持网址策略校验而停止。本轮尚未上传 OSS、尚未删除旧云端版本，不能声称公网自动升级已经可用。
+构建、本地验收及两个 GitHub 仓库发布已完成，远端 main/标签逐一核对通过。OSS 网页自动化通道持续超时；Firefox 备用通道因不支持网址策略校验而停止。本轮尚未上传 OSS、尚未删除旧云端版本，不能声称公网自动升级已经可用。
+
+## GitHub 发布记录
+
+- 源码 1.0.0：`public-v1.0.0` → `4ac01ab136c867d2817584b69aaeee8d19a19754`。
+- 源码 1.0.1：`public-v1.0.1` → `7f095f5fe58f264d8d17aa3cd4fa763e402f4711`。
+- 安装包 1.0.0：`public-v1.0.0` → `db1ed86305073fbadb3dc3db0248d2d161d399ef`。
+- 安装包 1.0.1：`public-v1.0.1` → `660c10e391a4c8e1a6751435a887d354525f203b`。
+
+[本次 1.0.0 完整 ZIP](https://github.com/GoodgoodBoys/planeGamePet/raw/refs/tags/public-v1.0.0/releases/public-1.0.0/PlanePet-Release-Single-1.0.0.zip) · [1.0.0 EXE](https://github.com/GoodgoodBoys/planeGamePet/raw/refs/tags/public-v1.0.0/releases/public-1.0.0/PlanePet.exe) · [1.0.1 完整 ZIP](https://github.com/GoodgoodBoys/planeGamePet/raw/refs/tags/public-v1.0.1/releases/public-1.0.1/PlanePet-Release-Single-1.0.1.zip)
+
+使用新 `public-v*` 标签，避免与较早同名 `release-v1.0.0` 归档混淆。1329 个源码/资源文件经过白名单与秘密材料扫描，包含 1113 个 assets 文件；未上传密钥、用户存档或后台数据。
 
 ## 冻结制品与验收
 
@@ -22,8 +33,9 @@
 - 两版单端/双端发行包、11 项发行前置拒绝检查、内嵌运行组件与素材摘要校验通过。
 - 保留的真实 1.0.0 更新代码已离线验证 1.0.1 RSA、SHA-256、长度、最低版本和正式通道；篡改签名、旧通道及 epoch 不符均拒绝。
 - GitHub 安装包从冻结 ZIP 解压并逐个比对 EXE 摘要，未误用后续同名重编译产物。
+- 1.0.1 完整核心回归再次通过，含网关、统计、绑定生命周期、版本兼容、更新安装/回滚/中断恢复和两类发行包检查。关于页 1.0.1 与同排操作栏截图已查看，显示正常。
 
-仍需在 OSS 可操作后完成：清理精确盘点的旧 PlanePet 公开发行对象，上传两个冻结版本及清单/签名；用 1.0.0 程序执行真实公网检查、下载、替换重启、档案保留与 1.0.1 最新版本检测。清理前先保存旧清单/发行对象，不清理用户数据或 ECS 救援备份。
+仍需在 OSS 可操作后完成：清理精确盘点的旧 PlanePet 公开发行对象，上传两个冻结版本及清单/签名；用 1.0.0 程序执行真实公网检查、下载、替换重启、档案保留与 1.0.1 最新版本检测。清理前先保存旧清单/发行对象，不清理用户数据或 ECS 救援备份。已另备 `release_out/oss-ready-20260909/plane-pet/windows/release/`，只含需上传的 10 个公开文件，不含 `.publish.lock`、测试探针或私钥。
 
 ## 发布与清理范围
 

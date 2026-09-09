@@ -10,9 +10,9 @@ namespace plane_pet_version {
 constexpr uint8_t kReleaseEpoch = 1;
 constexpr uint8_t kMajor = 1;
 constexpr uint8_t kMinor = 0;
-constexpr uint8_t kPatch = 0;
-constexpr char kString[] = "1.0.0";
-constexpr wchar_t kWideString[] = L"1.0.0";
+constexpr uint8_t kPatch = 1;
+constexpr char kString[] = "1.0.1";
+constexpr wchar_t kWideString[] = L"1.0.1";
 constexpr char kProductId[] = "plane-pet-windows";
 constexpr char kReleaseChannel[] = "release";
 

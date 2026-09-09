@@ -17,6 +17,23 @@ int main() {
        L"-" + std::to_wstring(GetTickCount64()));
   Manager manager;
   manager.Configure(nullptr, "invalid", root / "update.request", true, 0);
+  manager.ReportInstallFailure(L"隔离升级失败原因");
+  auto recovery = manager.GetSnapshot();
+  check("startup_failure_is_visible", recovery.state == State::Error &&
+      recovery.message == L"隔离升级失败原因" && recovery.installationFailure &&
+      ShouldShowPrompt(recovery, true));
+  manager.Dismiss();
+  Access::Error(manager);
+  check("dismissed_recovery_not_revived", manager.GetSnapshot().state == State::Idle);
+  Manager disabled;
+  disabled.Configure(nullptr, "invalid", root / "disabled.request", false, 0);
+  disabled.ReportInstallFailure(L"不应显示");
+  check("disabled_recovery_ignored", disabled.GetSnapshot().state == State::Disabled);
+  Access::Seed(manager, State::Checking, false);
+  Access::Error(manager);
+  manager.Tick(false, false, false, false);
+  check("automatic_check_failure_retries", Access::ShortAutomaticRetryScheduled(manager));
+  manager.Dismiss();
   const State states[] = {State::Checking, State::Current, State::Available,
                          State::Required, State::Downloading, State::Error};
   bool dismissed = true;
@@ -63,6 +80,10 @@ int main() {
   check("required_no_same_version_download",
         manager.GetSnapshot().state == State::Required &&
         !manager.GetSnapshot().canDownload && !manager.AcceptAndDownload());
+  Access::Seed(manager, State::Checking, true, true);
+  Access::CheckResult(manager, Access::Manifest("0.0.0"));
+  check("required_never_downloads_older_version", !manager.GetSnapshot().canDownload &&
+        !manager.AcceptAndDownload());
   Access::Seed(manager, State::Checking, false, false);
   Access::CheckResult(manager, Access::Manifest());
   check("minor_release_optional", manager.GetSnapshot().state == State::Available &&
@@ -106,7 +127,7 @@ int main() {
   Access::Seed(manager, State::Checking, false);
   Access::SetWorkerBusy(manager, true);
   manager.CheckNow(true);
-  Access::CheckResult(manager, Access::Manifest("2.0.0"));
+  Access::CheckResult(manager, Access::Manifest(Access::FutureMajorVersion()));
   Access::SetWorkerBusy(manager, false);
   check("manual_joins_automatic_check", manager.GetSnapshot().manual &&
         manager.GetSnapshot().required && manager.GetSnapshot().canDownload);

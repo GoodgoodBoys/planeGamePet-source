@@ -28,9 +28,22 @@ int main(int argc, char **argv) {
           manifest.minimumVersion != "1.0.0" || artifact.size() != manifest.size ||
           !Sha256(artifact.data(), artifact.size(), digest) || Hex(digest) != manifest.sha256)
         return 2;
+      // The public version reset must not accept the old stable namespace,
+      // even if its numeric version happens to equal public 1.0.0.
+      const std::string validJson(manifestBytes.begin(), manifestBytes.end());
+      for (const auto &change : std::vector<std::pair<std::string, std::string>>{
+               {"\"channel\": \"release\"", "\"channel\": \"stable\""},
+               {"\"release_epoch\": 1", "\"release_epoch\": 0"}}) {
+        std::string invalid = validJson;
+        const auto at = invalid.find(change.first);
+        if (at == std::string::npos) return 9;
+        invalid.replace(at, change.first.size(), change.second);
+        Manager::Manifest rejected;
+        if (ParseManifest({invalid.begin(), invalid.end()}, rejected)) return 10;
+      }
       manifestBytes.front() ^= 1;
       if (VerifyManifestSignature(manifestBytes, signature)) return 3;
-      std::printf("UPDATE_OFFLINE_PROBE_OK client=%s latest=%s rsa=1 sha256=1 size=1 tamper_rejected=1\n",
+      std::printf("UPDATE_OFFLINE_PROBE_OK client=%s latest=%s rsa=1 sha256=1 size=1 tamper_rejected=1 legacy_channel_epoch_rejected=1\n",
                   plane_pet_version::kString, manifest.version.c_str());
       return 0;
     }

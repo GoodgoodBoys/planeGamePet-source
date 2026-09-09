@@ -1,9 +1,9 @@
 [Unit]
-Description=Check Plane Pet public IP certificate renewal every six hours
+Description=Check Plane Pet public IP certificate renewal hourly, without an end date
 
 [Timer]
-OnCalendar=*-*-* 00,06,12,18:17:00
-RandomizedDelaySec=15m
+OnCalendar=*-*-* *:17:00
+RandomizedDelaySec=10m
 Persistent=true
 
 [Install]

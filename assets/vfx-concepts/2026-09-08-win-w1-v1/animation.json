@@ -1,0 +1,9 @@
+{
+  "name": "WIN W1", "fps": 50, "frames": 120, "frame_ms": 20,
+  "loop_ms": 2400, "width": 384, "height": 160,
+  "atlas_columns": 10, "atlas_rows": 12, "order": "row-major",
+  "scale_peak": 1.12, "scale_up_ms": 180, "shine_start_ms": 180,
+  "shine_end_ms": 700, "return_end_ms": 900, "hold_ms": 1500,
+  "shine_width_relative_to_previous_hit": 2, "old_hit_master_width": 314,
+  "transparent_rgba": true, "first_last_identical": true
+}

@@ -161,6 +161,15 @@ void RecordFailure(const std::filesystem::path &data,
   WriteText(data / L"update.failure", reason + L"\n");
 }
 
+bool PreserveLastGood(const std::filesystem::path &target) {
+  const auto backup = target.wstring() + L".old";
+  const auto retained = target.wstring() + L".last-good";
+  std::error_code error;
+  if (!std::filesystem::exists(backup, error)) return !error;
+  return MoveFileExW(backup.c_str(), retained.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE;
+}
+
 void Trace(const std::filesystem::path &data, bool enabled,
            const char *message) {
   if (!enabled) return;
@@ -214,7 +223,9 @@ int RecoverInterrupted(const std::filesystem::path &target,
       return FailAndRestart(target, data, 7, L"旧版本恢复失败，备份已保留。请重新解压安装包。", false);
     restored = true;
   } else if (healthy) {
-    DeleteFileW(backup.c_str());
+    if (!PreserveLastGood(target))
+      return FailAndRestart(target, data, 7,
+          L"新版已启动，但旧版备份归档失败。备份和恢复记录已保留，请解除文件占用后重试。", false);
   }
   DeleteFileW(staged.c_str());
   DeleteFileW(pending.c_str());
@@ -339,7 +350,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     if (healthy) {
       Trace(data, trace, "health_confirmed");
       CloseHandle(next.hProcess);
-      DeleteFileW(backup.c_str());
+      if (!PreserveLastGood(target)) {
+        // Keep the healthy transaction journal so the next start can retry
+        // archiving. Never discard the only rollback copy on an I/O failure.
+        RecordFailure(data, L"升级成功，但旧版备份归档未完成；恢复记录已保留。");
+        return 0;
+      }
       DeleteFileW(pending.c_str());
       DeleteFileW((data / L"update.request").c_str());
       DeleteFileW((data / L"update.failure").c_str());

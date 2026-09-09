@@ -357,10 +357,14 @@ bool ParseManifest(const std::vector<uint8_t> &bytes,
   const std::string json(bytes.begin(), bytes.end());
   uint64_t schema = 0;
   std::string product;
+  std::string channel;
+  uint64_t epoch = 0;
   std::string summary;
   if (!JsonUnsigned(json, "schema", schema) || schema != 1 ||
       !JsonString(json, "product_id", product) ||
       product != plane_pet_version::kProductId ||
+      !JsonString(json, "channel", channel) || channel != plane_pet_version::kReleaseChannel ||
+      !JsonUnsigned(json, "release_epoch", epoch) || epoch != plane_pet_version::kReleaseEpoch ||
       !JsonString(json, "version", manifest.version) ||
       !JsonString(json, "minimum_supported_version",
                   manifest.minimumVersion) ||
@@ -456,6 +460,16 @@ void Manager::Tick(bool idleUiAvailable, bool peerVersionDiffers,
   lastPeerMajorRequirement_ = peerMajorMismatch;
   JoinFinishedWorker();
   if (!Enabled() || workerRunning_.load()) return;
+  const unsigned completion = checkCompletion_.exchange(0);
+  if (completion == 1) {
+    // Worker communicates intent atomically; scheduling remains on the UI
+    // thread. Temporary OSS manifest/signature mismatch must not cost a day.
+    const unsigned shift = std::min(failedAutomaticChecks_, 5U);
+    nextAutomaticCheckMs_ = UnixTimeMillis() + (5ULL * 60 * 1000 << shift);
+    failedAutomaticChecks_ = std::min(failedAutomaticChecks_ + 1, 5U);
+  } else if (completion == 2) {
+    failedAutomaticChecks_ = 0;
+  }
   if (pendingManualCheck_) {
     if (!idleUiAvailable) return;
     const bool required = pendingRequiredCheck_;
@@ -517,6 +531,7 @@ void Manager::StartCheck(bool manual, bool requiredByPeer) {
     snapshot_ = Snapshot{};
     snapshot_.currentVersion = plane_pet_version::kWideString;
     snapshot_.state = State::Checking;
+    checkCompletion_.store(0);
     snapshot_.manual = manual;
     snapshot_.required = requiredByPeer;
     snapshot_.message = L"正在安全检查新版本…";
@@ -576,6 +591,7 @@ void Manager::PublishCheckResult(const Manifest &parsed) {
     const bool requiredByPeer = snapshot_.required;
     manifest_ = parsed;
     snapshot_.latestVersion = Wide(parsed.version);
+    checkCompletion_.store(2);
     for (size_t index = 0; index < 3; ++index)
       snapshot_.summary[index] = parsed.summary[index];
     snapshot_.required = requiredByPeer || belowMinimum;
@@ -686,19 +702,28 @@ void Manager::PublishInstallRequest(const Manifest &manifest,
 
 void Manager::ReportInstallFailure(const std::wstring &message) {
   if (!Enabled()) return;
-  cancel_.store(false);
   {
     std::lock_guard<std::mutex> lock(mutex_);
+    // Recovery is not a HTTP completion. Preserve SetError's late-worker guard.
+    if (snapshot_.state != State::Idle || workerRunning_.load()) return;
+    cancel_.store(false);
     snapshot_.manual = true;
+    snapshot_.state = State::Error;
+    snapshot_.message = message;
+    snapshot_.canDownload = false;
+    snapshot_.installationFailure = true;
+    ++snapshot_.generation;
   }
   nextAutomaticCheckMs_ = UnixTimeMillis() + 24ULL * 60 * 60 * 1000;
-  SetError(message);
+  PostMessageW(owner_, kChangedMessage, 0, 0);
 }
 
 void Manager::SetError(const std::wstring &message) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (cancel_.load() || (snapshot_.state != State::Checking &&
                          snapshot_.state != State::Downloading)) return;
+  if (snapshot_.state == State::Checking && !snapshot_.manual)
+    checkCompletion_.store(1);
   if (snapshot_.state == State::Downloading) snapshot_.manual = true;
   snapshot_.state = State::Error;
   snapshot_.message = message;
@@ -710,6 +735,7 @@ void Manager::SetError(const std::wstring &message) {
 void Manager::Dismiss() {
   std::lock_guard<std::mutex> lock(mutex_);
   cancel_.store(true);
+  checkCompletion_.store(0);
   installRequestReady_.store(false);
   pendingManualCheck_ = pendingRequiredCheck_ = false;
   const State state = snapshot_.state == State::Disabled

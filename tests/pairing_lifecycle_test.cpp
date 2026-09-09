@@ -12,6 +12,7 @@
 #include <ws2tcpip.h>
 
 #include "../common/pairing_protocol.h"
+#include "../common/dnd_protocol.h"
 #include "../shared/plane_protocol.h"
 
 namespace {
@@ -45,6 +46,19 @@ bool TestAuthenticatedProtocol() {
     return false;
   }
   control[12] ^= 1U;
+  if (pcpair::Parse(control, sizeof(control), parsed, key)) return false;
+  source.appVersion = pcpair::CurrentAppVersion();
+  if (!pcpair::Serialize(source, control, sizeof(control), key) || control[2] != 4 ||
+      !pcpair::Parse(control, sizeof(control), parsed, key) || parsed.appVersion.releaseEpoch != 1) return false;
+  // A public client receives an epoch-tagged legacy peer; an old client still
+  // receives exactly the legacy envelope and uses compatibility flags to gate.
+  source.wireVersion = 4; source.appVersion = {3, 0, 12};
+  if (!pcpair::Serialize(source, control, sizeof(control), key) ||
+      !pcpair::Parse(control, sizeof(control), parsed, key) || parsed.appVersion.releaseEpoch != 0) return false;
+  source.wireVersion = 3; source.appVersion = pcpair::CurrentAppVersion();
+  if (!pcpair::Serialize(source, control, sizeof(control), key) || control[2] != 3 || control[32] > 8 ||
+      !pcpair::Parse(control, sizeof(control), parsed, key)) return false;
+  control[32] ^= 0x10;
   if (pcpair::Parse(control, sizeof(control), parsed, key)) return false;
 
   uint8_t packet[pcpair::kMaxDatagramSize]{};
@@ -411,7 +425,10 @@ int RunStorageError(uint16_t port, uint32_t code) {
 bool HasCompatibility(const Peer &peer, uint8_t expectedFlags,
                       pcpair::AppVersion expectedPeer) {
   return peer.compatibilityMessages > 0 &&
-         peer.compatibilityFlags == (expectedFlags | pcpair::ScopedActionsSupported) &&
+         // Capability bits may be added without changing version decisions.
+         (peer.compatibilityFlags & 0x1FU) == expectedFlags &&
+         (peer.compatibilityFlags & (pcpair::ScopedActionsSupported | pcpair::kDndSupported)) ==
+             (pcpair::ScopedActionsSupported | pcpair::kDndSupported) &&
          peer.peerAppVersion.major == expectedPeer.major &&
          peer.peerAppVersion.minor == expectedPeer.minor &&
          peer.peerAppVersion.patch == expectedPeer.patch;

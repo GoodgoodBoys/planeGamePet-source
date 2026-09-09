@@ -12,6 +12,9 @@
 namespace pcpair {
 
 constexpr uint8_t kProtocolVersion = 3;
+// V4 keeps the 48-byte authenticated envelope. The high nibble of status
+// carries the peer's release epoch; V3 remains byte-for-byte readable.
+constexpr uint8_t kReleaseProtocolVersion = 4;
 constexpr size_t kMessageSize = 48;
 constexpr size_t kAuthTagSize = 8;
 constexpr size_t kMaxDatagramSize = plink::kMaxPacketSize + kAuthTagSize;
@@ -166,9 +169,26 @@ struct AppVersion {
   uint8_t major = 0;
   uint8_t minor = 0;
   uint8_t patch = 0;
+  uint8_t releaseEpoch = 0;
 
   bool Known() const { return major != 0 || minor != 0 || patch != 0; }
 };
+
+inline uint8_t WireVersionFor(const AppVersion &version) {
+  return version.releaseEpoch ? kReleaseProtocolVersion : kProtocolVersion;
+}
+
+inline uint8_t GameProtocolFor(const AppVersion &version) {
+  // Explicit public-1.x -> existing, fully verified battle protocol mapping.
+  // An unknown future release major must not silently fall back to old motion.
+  if (version.releaseEpoch == 1) return version.major == 1 ? 3 : 0;
+  return version.major <= 3 ? version.major : 0;
+}
+
+inline bool SameMajorFamily(const AppVersion &a, const AppVersion &b) {
+  return !a.Known() || !b.Known() ||
+      (a.releaseEpoch == b.releaseEpoch && a.major == b.major);
+}
 
 enum CompatibilityFlag : uint8_t {
   PeerVersionKnown = 1U << 0U,
@@ -181,10 +201,11 @@ enum CompatibilityFlag : uint8_t {
 
 inline AppVersion CurrentAppVersion() {
   return {plane_pet_version::kMajor, plane_pet_version::kMinor,
-          plane_pet_version::kPatch};
+          plane_pet_version::kPatch, plane_pet_version::kReleaseEpoch};
 }
 
 struct Message {
+  uint8_t wireVersion = 0;  // 0 selects by sender version; responses select recipient format.
   MessageType type = MessageType::Status;
   uint32_t deviceId = 0;
   uint32_t requestId = 0;
@@ -275,7 +296,10 @@ inline bool Serialize(const Message &message, uint8_t *bytes, size_t capacity,
   memset(bytes, 0, kMessageSize);
   bytes[0] = 'P';
   bytes[1] = 'B';
-  bytes[2] = kProtocolVersion;
+  const uint8_t wire = message.wireVersion ? message.wireVersion : WireVersionFor(message.appVersion);
+  if ((wire != kProtocolVersion && wire != kReleaseProtocolVersion) || message.appVersion.releaseEpoch > 1)
+    return false;
+  bytes[2] = wire;
   bytes[3] = static_cast<uint8_t>(message.type);
   plink::PutU32(bytes + 4, message.deviceId);
   plink::PutU32(bytes + 8, message.requestId);
@@ -284,7 +308,8 @@ inline bool Serialize(const Message &message, uint8_t *bytes, size_t capacity,
   plink::PutU32(bytes + 20, message.tokenLow);
   plink::PutU32(bytes + 24, message.tokenHigh);
   plink::PutU32(bytes + 28, message.peerDeviceId);
-  bytes[32] = static_cast<uint8_t>(message.status);
+  bytes[32] = static_cast<uint8_t>(message.status) |
+      (wire == kReleaseProtocolVersion ? static_cast<uint8_t>(message.appVersion.releaseEpoch << 4U) : 0);
   bytes[33] = message.assignedSlot;
   bytes[34] = message.appVersion.major;
   bytes[35] = message.appVersion.minor;
@@ -298,20 +323,23 @@ inline bool Serialize(const Message &message, uint8_t *bytes, size_t capacity,
 inline bool Parse(const uint8_t *bytes, size_t length, Message &message,
                   const AuthKey &key = AuthKey{}) {
   if (bytes == nullptr || length != kMessageSize || bytes[0] != 'P' ||
-      bytes[1] != 'B' || bytes[2] != kProtocolVersion ||
+      bytes[1] != 'B' || (bytes[2] != kProtocolVersion && bytes[2] != kReleaseProtocolVersion) ||
       plink::GetU16(bytes + 38) != plink::Crc16Ccitt(bytes, 38) ||
       (key.Enabled() && ReadU64(bytes + 40) != SipHash24(bytes, 40, key)) ||
       (!key.Enabled() && ReadU64(bytes + 40) != 0)) {
     return false;
   }
   const uint8_t type = bytes[3];
-  const uint8_t status = bytes[32];
+  const uint8_t epoch = bytes[2] == kReleaseProtocolVersion ? bytes[32] >> 4U : 0;
+  const uint8_t status = bytes[2] == kReleaseProtocolVersion ? bytes[32] & 0x0FU : bytes[32];
+  if (epoch > 1) return false;
   if (type < static_cast<uint8_t>(MessageType::Start) ||
       type > static_cast<uint8_t>(MessageType::Unbind) ||
       status > static_cast<uint8_t>(Status::StorageError)) {
     return false;
   }
   message.type = static_cast<MessageType>(type);
+  message.wireVersion = bytes[2];
   message.deviceId = plink::GetU32(bytes + 4);
   message.requestId = plink::GetU32(bytes + 8);
   message.pairingCode = plink::GetU32(bytes + 12);
@@ -321,7 +349,7 @@ inline bool Parse(const uint8_t *bytes, size_t length, Message &message,
   message.peerDeviceId = plink::GetU32(bytes + 28);
   message.status = static_cast<Status>(status);
   message.assignedSlot = bytes[33];
-  message.appVersion = {bytes[34], bytes[35], bytes[36]};
+  message.appVersion = {bytes[34], bytes[35], bytes[36], epoch};
   message.compatibilityFlags = bytes[37];
   return true;
 }

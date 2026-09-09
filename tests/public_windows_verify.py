@@ -1,7 +1,9 @@
 """Explicit opt-in public verification using two real Windows WinHTTP tunnels.
 
 Uses fresh test IDs and an isolated local profile; no personal saved pair is read.
-Creates two test gateway credentials. Desktop event logs stay LOCAL (upload off).
+By default creates two test gateway credentials; --existing-qa-credentials
+instead copies existing encrypted QA credentials and does not enroll.
+Desktop event logs stay LOCAL (upload off).
 """
 import argparse
 import hashlib
@@ -9,11 +11,14 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import socket
+import statistics
 import subprocess
 import time
 
 from server_edge_test import control, recv_until
+from public_latency_probe import fingerprints, valid_credential
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -36,7 +41,12 @@ def stop(process):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--allow-public-test', action='store_true', required=True)
-    parser.parse_args()
+    parser.add_argument('--existing-qa-credentials', action='store_true')
+    parser.add_argument('--latency-client', type=Path,
+                        help='Client compiled with PLANE_PET_LATENCY_SELF_TEST')
+    parser.add_argument('--dnd-ui', action='store_true', help='Exercise isolated actual HWNDs; requires --latency-client')
+    cli = parser.parse_args()
+    assert not cli.dnd_ui or cli.latency_client
     assert os.name == 'nt'
     task = ROOT / 'dist' / ('public-online-check-' + secrets.token_hex(6))
     task.mkdir()
@@ -50,6 +60,13 @@ def main():
     for sock in reservations:
         sock.close()
     tokens = [secrets.token_hex(32) for _ in range(2)]
+    originals = Path(os.environ['LOCALAPPDATA']) / 'PlanePet'
+    original_hashes = fingerprints(originals)
+    credential_copies = []
+    if cli.existing_qa_credentials:
+        for side in ('a', 'b'):
+            valid_credential(originals / f'tunnel-dual-qa-{side}.credential')
+        tokens = []
     metadata = {'digests': [hashlib.sha256(t.encode()).hexdigest() for t in tokens],
                 'started_at_ms': int(time.time() * 1000), 'telemetry_uploaded': False}
     (task / 'test-identity-manifest.json').write_text(json.dumps(metadata, indent=2))
@@ -82,7 +99,11 @@ def main():
                 '--hidden=1', f'--slot={index+1}']
         if automated:
             args.append('--auto-invite=1' if index == 0 else '--auto-accept=1')
-        return launch('PlanePetClient.exe', args)
+        if cli.latency_client:
+            args.append(f'--rtt-report={task / (name + ".rtt.csv")}')
+            args.append('--latency-move=1')
+            if cli.dnd_ui: args.append(f'--dnd-test-report={task / (name + ".dnd.txt")}')
+        return launch(str(cli.latency_client.resolve()) if cli.latency_client else 'PlanePetClient.exe', args)
 
     def cleanup_test_binding():
         path = task / 'alice.binding'
@@ -109,13 +130,25 @@ def main():
 
     try:
         for index in range(2):
+            credential_args = []
+            if cli.existing_qa_credentials:
+                profile = task / 'PlanePet'
+                profile.mkdir(exist_ok=True)
+                copy = profile / f'tunnel-verify-{index}.credential'
+                shutil.copyfile(originals / f'tunnel-dual-qa-{("a", "b")[index]}.credential', copy)
+                credential_copies.append(copy)
+                credential_args = ['--enroll=0']
+            else:
+                credential_args = [f'--token={tokens[index]}']
             tunnels.append(launch('PlanePetTunnel.exe', [f'--instance=verify-{index}',
-                f'--local-port={ports[index]}', f'--token={tokens[index]}']))
+                f'--local-port={ports[index]}', *credential_args]))
         for index in range(2):
             log = task / 'PlanePet' / f'tunnel-verify-{index}.log'
             wait_for(lambda: log.exists() and ' connected error=0' in log.read_text(),
                      'Public WinHTTP tunnel did not connect')
         print('PUBLIC_WINHTTP_TLS_TWO_TUNNELS_OK', flush=True)
+        from dnd_wire_probe import run_dnd_wire
+        run_dnd_wire(ports)
         result = subprocess.run([str(ROOT / 'dist' / 'PlanePetIntegrationTest.exe'),
             str(ports[0]), str(code), str(ports[1]), 'public', str(base + 10000)],
             cwd=task, env=env, capture_output=True, text=True, timeout=40,
@@ -127,6 +160,26 @@ def main():
         wait_for(lambda: events('alice', 'game_started') == 1 and events('bob', 'game_started') == 1,
                  'Actual desktop clients did not enter public game')
         print('PUBLIC_DESKTOP_PAIR_INVITE_HIDDEN_PEER_COUNTDOWN_PLAYING_OK', flush=True)
+        if cli.latency_client:
+            def playing_samples(name):
+                path = task / (name + '.rtt.csv')
+                return [list(map(int, row.split(','))) for row in path.read_text().splitlines()
+                        if row.startswith('3,')] if path.exists() else []
+            wait_for(lambda: all(len(playing_samples(n)) >= 12 for n in ('alice', 'bob')),
+                     'Not enough RTT observations from real gameplay', timeout=25)
+            results = {}
+            for name in ('alice', 'bob'):
+                rows = playing_samples(name)
+                samples = sorted(r[1] for r in rows)
+                results[name] = dict(count=len(rows), median_ms=statistics.median(samples),
+                    p95_ms=samples[min(len(samples)-1, int(len(samples)*.95))],
+                    max_ms=max(samples), hud_last_ms=rows[-1][2],
+                    compact_client=all(r[3:] == [240, 372] for r in rows))
+                assert results[name]['compact_client'], 'Game client is not original compact size'
+                assert results[name]['median_ms'] < 200, 'Public gameplay RTT regression'
+                assert results[name]['p95_ms'] < 400, 'Public gameplay tail RTT regression'
+            (task / 'gameplay-latency.json').write_text(json.dumps(results, indent=2))
+            print('PUBLIC_REAL_CLIENT_RTT ' + json.dumps(results), flush=True)
         stop(clients[1])
         clients.append(desktop(0, False, False))
         wait_for(lambda: events('bob', 'game_finished') == 1 and events('alice', 'game_finished') == 1,
@@ -137,6 +190,15 @@ def main():
             history = (task / (name + '.history')).read_text().splitlines()[0].split()
             assert history[:2] == ['PLANE_PET_HISTORY', '2'] and int(history[2]) == 1
         print('PUBLIC_DESKTOP_AUTO_RESUME_DISCONNECT_REASON_HISTORY_ONCE_OK', flush=True)
+        if cli.dnd_ui:
+            from dnd_public_ui import run_dnd_ui
+            def restart_b():
+                stop(clients[0])
+                (task / 'bob.dnd.txt').unlink(missing_ok=True)
+                process = desktop(1, False, False)
+                clients.append(process)
+                return process
+            run_dnd_ui(task, [clients[-1], clients[0]], restart_b)
     finally:
         for process in clients:
             stop(process)
@@ -145,6 +207,10 @@ def main():
         finally:
             for process in reversed(processes):
                 stop(process)
+            for copy in credential_copies:
+                assert copy.resolve().parent == (task / 'PlanePet').resolve()
+                copy.unlink(missing_ok=True)
+            assert fingerprints(originals) == original_hashes, 'Original user profile changed'
     print('PUBLIC_WINDOWS_VERIFICATION_OK formal_profile_untouched=1 telemetry_upload=0', flush=True)
 
 

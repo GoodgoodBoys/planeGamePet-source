@@ -5,4 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/certbot-ip-v5/bin/certbot renew --quiet --no-random-sleep-on-renew --deploy-hook "/bin/systemctl reload nginx"
+ExecStart=/usr/bin/python3 /opt/plane-pet/ops/renew-plane-pet-certificate.py
+TimeoutStartSec=10min
+UMask=0077

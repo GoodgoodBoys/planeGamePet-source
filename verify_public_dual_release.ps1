@@ -5,13 +5,17 @@
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$releaseHeader = Get-Content -Raw -LiteralPath (Join-Path $root 'common\app_version.h')
+$releaseVersion = if ($releaseHeader -match 'kString\[\] = "(\d+\.\d+\.\d+)"') { $Matches[1] } else { throw 'Missing release version' }
+$FormalRelease = ($releaseHeader -match 'kReleaseEpoch = 1;') -and (-not $ExpectedVersion -or $ExpectedVersion -eq $releaseVersion)
+$packageFamily = if ($FormalRelease) { 'Release' } else { 'Public' }
 if ([string]::IsNullOrWhiteSpace($ExpectedVersion)) {
     $taskVersionHeader = Get-Content -Raw -LiteralPath (Join-Path $root 'common\app_version.h')
     if ($taskVersionHeader -notmatch 'kString\[\] = "(\d+\.\d+\.\d+)"') { throw 'Missing app version' }
     $ExpectedVersion = $Matches[1]
 }
 if ([string]::IsNullOrWhiteSpace($Archive)) {
-    $Archive = Join-Path $root "dist\PlanePet-Public-DualLocal-$ExpectedVersion.zip"
+    $Archive = Join-Path $root "dist\PlanePet-$packageFamily-DualLocal-$ExpectedVersion.zip"
 }
 $Archive = [IO.Path]::GetFullPath($Archive)
 if (-not (Test-Path -LiteralPath $Archive -PathType Leaf)) {
@@ -29,6 +33,24 @@ try {
             -not $_.FullName.EndsWith('/')
         } | ForEach-Object FullName | Sort-Object)
         $expected = @("PlanePet.exe", "使用说明.txt") | Sort-Object
+        if ($FormalRelease -or [version]$ExpectedVersion -ge [version]'1.0.16') {
+            $expected += 'HELP.md'
+            $helpEntry = $zip.Entries | Where-Object FullName -eq 'HELP.md'
+            if (-not $helpEntry) { throw 'Missing help document' }
+            $helpReader = [IO.StreamReader]::new($helpEntry.Open(), [Text.Encoding]::UTF8)
+            try { $helpText = $helpReader.ReadToEnd() } finally { $helpReader.Dispose() }
+            if ($helpText -cne (Get-Content -Raw -LiteralPath (Join-Path $root 'HELP.md'))) {
+                throw 'Packaged help differs from the approved help document'
+            }
+        }
+        if ($FormalRelease -or [version]$ExpectedVersion -ge [version]'1.0.3') {
+            $expected += @('PRIVACY.md', 'THIRD-PARTY-NOTICES.md')
+            $expected += @($names | Where-Object { $_ -match '^licenses/(gcc|mingw-w64|winpthreads)/[A-Za-z0-9._-]+$' })
+            foreach ($requiredLicense in @('licenses/gcc/COPYING.RUNTIME','licenses/mingw-w64/COPYING','licenses/winpthreads/COPYING')) {
+                if ($requiredLicense -notin $names) { throw "Missing license: $requiredLicense" }
+            }
+            $expected = $expected | Sort-Object
+        }
         if (($names -join "|") -ne ($expected -join "|")) {
             throw "Unexpected dual archive contents: $($names -join ', ')"
         }
@@ -50,7 +72,7 @@ try {
     }
     $unicode = [Text.Encoding]::Unicode.GetString($bytes)
     foreach ($marker in @(
-            "runtime-public-dual-", "PlanePetPublicDualLauncher",
+            $(if ($FormalRelease) { "runtime-release-dual-" } else { "runtime-public-dual-" }), "PlanePetPublicDualLauncher",
             "PlanePetTunnel.exe", "PlanePetClient.exe")) {
         if (-not $unicode.Contains($marker)) {
             throw "Missing embedded dual-launcher marker: $marker"
@@ -65,12 +87,23 @@ try {
             "单机双端公网测试版 v$ExpectedVersion", "TLS", "四个表情",
             "在线状态", "显示/隐藏", "显示绑定电脑框", "勿扰状态", "发送/接收",
             "绑定存储", "联网鉴权", "来源网络信息",
-            "原始安装凭据不会上传", "退出")) {
+            "不可逆哈希", "退出")) {
         if (-not $instructions.Contains($required)) {
             throw "Dual instructions are missing required text: $required"
         }
     }
+    if ($FormalRelease -or [version]$ExpectedVersion -ge [version]'3.0.8') {
+        foreach ($required in @('通过 TLS 加密连接传输用于鉴权', '而非原始令牌', '关于…', '开发者 Ding', '离线阅读隐私说明和完整第三方许可')) {
+            if (-not $instructions.Contains($required)) { throw "Missing About/privacy dual text: $required" }
+        }
+        if ($instructions.Contains('原始安装凭据不会上传')) { throw 'Obsolete credential transmission claim' }
+    }
     $built = Join-Path $root "dist\PlanePetPublicDual.exe"
+    if ($FormalRelease -or [version]$ExpectedVersion -ge [version]'1.0.3') {
+        foreach ($label in @('设置与隐私', '帮助与更新', '匿名使用统计', '检查更新仍置灰')) {
+            if (-not $instructions.Contains($label)) { throw "Missing grouped dual menu documentation: $label" }
+        }
+    }
     if ((Get-FileHash -Algorithm SHA256 -LiteralPath $built).Hash -ne
         (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash) {
         throw "Packaged dual launcher does not match the fresh build."
@@ -79,7 +112,7 @@ try {
     Write-Output "PUBLIC_DUAL_STATIC_OK"
     Write-Output "archive=$Archive"
     Write-Output "sha256=$hash"
-    Write-Output "pe=x64-gui embedded=two-clients+two-tunnels entries=2"
+    Write-Output "pe=x64-gui embedded=two-clients+two-tunnels entries=$($names.Count)"
 }
 finally {
     $resolved = [IO.Path]::GetFullPath($testRoot)

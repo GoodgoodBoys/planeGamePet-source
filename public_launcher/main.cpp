@@ -8,6 +8,9 @@
 #include <string>
 
 #include "../common/app_version.h"
+#include "../common/windows_arguments.h"
+#include "../common/windows_activation.h"
+#include "../common/network_status.h"
 
 namespace {
 
@@ -30,9 +33,9 @@ struct OwnedJob {
   ~OwnedJob() { if (gOwnedJob) CloseHandle(gOwnedJob); }
 };
 constexpr wchar_t kManifestUrl[] =
-    L"https://egg-ota-test.oss-cn-beijing.aliyuncs.com/plane-pet/windows/stable/latest.json";
+    L"https://egg-ota-test.oss-cn-beijing.aliyuncs.com/plane-pet/windows/release/latest.json";
 
-std::wstring Quote(const std::wstring &value) { return L"\"" + value + L"\""; }
+std::wstring Quote(const std::wstring &value) { return plane_pet_windows::Quote(value); }
 
 std::wstring WideUtf8(const std::string &text) {
   if (text.empty()) return {};
@@ -50,16 +53,7 @@ std::wstring WideUtf8(const std::string &text) {
 }
 
 std::wstring Option(const wchar_t *name) {
-  const std::wstring command = GetCommandLineW();
-  const std::wstring prefix = std::wstring(L"--") + name + L"=";
-  size_t begin = command.find(prefix);
-  if (begin == std::wstring::npos) return L"";
-  begin += prefix.size();
-  const bool quoted = begin < command.size() && command[begin] == L'"';
-  if (quoted) ++begin;
-  size_t end = quoted ? command.find(L'"', begin) : command.find(L' ', begin);
-  if (end == std::wstring::npos) end = command.size();
-  return command.substr(begin, end - begin);
+  return plane_pet_windows::Option(name);
 }
 
 uint16_t LocalPort() {
@@ -191,14 +185,20 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   HANDLE mutex = CreateMutexW(nullptr, TRUE, L"PlanePetPublicLauncher");
   if (mutex == nullptr) return 1;
   if (GetLastError() == ERROR_ALREADY_EXISTS) {
-    MessageBoxW(nullptr, L"Plane Pet 已经在运行。", L"Plane Pet",
-                MB_OK | MB_ICONINFORMATION);
+    bool activated = false;
+    for (int attempt = 0; attempt < 20 && !activated; ++attempt) {
+      activated = plane_pet_windows::ActivatePublicInstance();
+      if (!activated) Sleep(100);
+    }
+    if (!activated) MessageBoxW(nullptr,
+        L"Plane Pet 已在运行或正在启动。\n请查看托盘；旧版客户端需先退出再运行新版。",
+        L"Plane Pet", MB_OK | MB_ICONINFORMATION);
     CloseHandle(mutex);
     return 0;
   }
   const std::filesystem::path data = DataDirectory();
   const std::filesystem::path runtime =
-      data / (std::wstring(L"runtime-public-") +
+      data / (std::wstring(L"runtime-release-") +
               plane_pet_version::kWideString);
   std::error_code error;
   std::filesystem::create_directories(runtime, error);
@@ -208,7 +208,9 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   const uint16_t localPort = LocalPort();
   if (error || !ExtractExecutable(kTunnelResource, tunnel) ||
       !ExtractExecutable(kClientResource, client) ||
-      !ExtractExecutable(kUpdaterResource, updater)) {
+      !ExtractExecutable(kUpdaterResource, updater) ||
+      !ExtractExecutable(204, runtime / L"THIRD-PARTY-NOTICES.txt") ||
+      !ExtractExecutable(205, runtime / L"PRIVACY.txt")) {
     MessageBoxW(nullptr, L"无法释放联网组件，请检查存档权限或安全软件拦截。",
                 L"Plane Pet", MB_OK | MB_ICONERROR);
     ReleaseMutex(mutex);
@@ -249,7 +251,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   Sleep(700);
   if (WaitForSingleObject(tunnelProcess.hProcess, 0) != WAIT_TIMEOUT) {
     CloseProcessHandles(tunnelProcess);
-    MessageBoxW(nullptr, L"加密联网隧道启动失败。", L"Plane Pet",
+    const auto network = plane_pet_network::Read(data / L"tunnel.status");
+    const auto reason = L"加密联网隧道启动失败。\n\n" +
+        plane_pet_network::Describe(network) + L"\n错误码：" + std::to_wstring(network.error);
+    MessageBoxW(nullptr, reason.c_str(), L"Plane Pet",
                 MB_OK | MB_ICONERROR);
     ReleaseMutex(mutex);
     CloseHandle(mutex);
@@ -260,13 +265,29 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   const std::wstring updateRequest = (data / L"update.request").wstring();
   const bool completedUpdate = !Option(L"complete-update").empty();
   const bool rolledBackUpdate = Option(L"update-rollback") == L"1";
+  const std::wstring readyName = completedUpdate
+      ? L"Local\\PlanePet.Ready." + std::to_wstring(GetCurrentProcessId()) +
+        L"." + std::to_wstring(GetTickCount64()) : L"";
+  HANDLE readyEvent = completedUpdate
+      ? CreateEventW(nullptr, TRUE, FALSE, readyName.c_str()) : nullptr;
+  struct ReadyHandle { HANDLE value; ~ReadyHandle() { if (value) CloseHandle(value); } } readyHandle{readyEvent};
+  if (completedUpdate && !readyEvent) {
+    StopOwnedProcess(tunnelProcess);
+    ReleaseMutex(mutex);
+    CloseHandle(mutex);
+    return 5;
+  }
   const std::wstring arguments =
       L"--server=127.0.0.1:" + std::to_wstring(localPort) +
       L" --code=0 --slot=1 --name=我 --peer=好友 "
       L"--pet-x=120 --pet-y=180 --telemetry-upload=1 --state=" + Quote(state) +
       L" --update-enabled=1 --update-manifest=" + Quote(kManifestUrl) +
       L" --update-request=" + Quote(updateRequest) +
-      (completedUpdate ? L" --update-installed=1" : L"") +
+      L" --public-instance=1" +
+      L" --network-status=" + Quote((data / L"tunnel.status").wstring()) +
+      (completedUpdate ? L" --ready-event=" + Quote(readyName) : L"") +
+      (completedUpdate ? L" --update-installed=1 --update-token=" +
+          Quote(Option(L"complete-update")) : L"") +
       (rolledBackUpdate ? L" --update-rollback=1" : L"") +
       (Option(L"update-failed") == L"1" ? L" --update-failed=1" : L"");
   if (!StartChild(client, arguments, 0, clientProcess, true)) {
@@ -287,7 +308,13 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     CloseHandle(mutex);
     return 4;
   }
-  if (!WriteHealthMarker(data, Option(L"complete-update"))) {
+  // Only commit after the initialized client has pumped its UI for 2 seconds.
+  // No dependency on a working Internet connection or a currently online peer.
+  HANDLE readiness[] = {readyEvent, clientProcess.hProcess, tunnelProcess.hProcess};
+  if (completedUpdate &&
+      (WaitForMultipleObjects(3, readiness, FALSE, 30000) != WAIT_OBJECT_0 ||
+       WaitForSingleObject(clientProcess.hProcess, 0) != WAIT_TIMEOUT ||
+       !WriteHealthMarker(data, Option(L"complete-update")))) {
     StopOwnedProcess(clientProcess);
     StopOwnedProcess(tunnelProcess);
     ReleaseMutex(mutex);

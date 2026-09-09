@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <string>
+#include "../common/app_version.h"
 
 namespace {
 
@@ -105,13 +106,16 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   }
 
   const std::filesystem::path data = DataDirectory();
-  const std::filesystem::path runtime = data / L"runtime-public-dual-1.0.0";
+  const std::filesystem::path runtime = data / (std::wstring(L"runtime-release-dual-") +
+                                              plane_pet_version::kWideString);
   std::error_code error;
   std::filesystem::create_directories(runtime, error);
   const std::filesystem::path tunnel = runtime / L"PlanePetTunnel.exe";
   const std::filesystem::path client = runtime / L"PlanePetClient.exe";
   if (error || !ExtractExecutable(kTunnelResource, tunnel) ||
-      !ExtractExecutable(kClientResource, client)) {
+      !ExtractExecutable(kClientResource, client) ||
+      !ExtractExecutable(204, runtime / L"THIRD-PARTY-NOTICES.txt") ||
+      !ExtractExecutable(205, runtime / L"PRIVACY.txt")) {
     MessageBoxW(nullptr, L"无法释放双端联网组件，请检查存档权限或安全软件拦截。",
                 L"Plane Pet", MB_OK | MB_ICONERROR);
     ReleaseMutex(mutex);
@@ -170,10 +174,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
                         : L"public-dual-b.binding")).wstring();
   std::wstring argumentsA =
       L"--server=127.0.0.1:32110 --code=0 --slot=1 --name=A端 --peer=B端 "
-      L"--pet-x=120 --pet-y=170 --telemetry-upload=1 --state=" + Quote(stateA);
+      L"--pet-x=120 --pet-y=170 --telemetry-upload=1 --state=" + Quote(stateA) +
+      L" --network-status=" + Quote((data / (testMode ? L"tunnel-dual-qa-a.status" : L"tunnel-dual-a.status")).wstring());
   std::wstring argumentsB =
       L"--server=127.0.0.1:32113 --code=0 --slot=2 --name=B端 --peer=A端 "
-      L"--pet-x=480 --pet-y=350 --telemetry-upload=1 --state=" + Quote(stateB);
+      L"--pet-x=480 --pet-y=350 --telemetry-upload=1 --state=" + Quote(stateB) +
+      L" --network-status=" + Quote((data / (testMode ? L"tunnel-dual-qa-b.status" : L"tunnel-dual-b.status")).wstring());
   if (testMode) {
     argumentsA += L" --telemetry=0 --hidden=1";
     argumentsB += L" --telemetry=0 --hidden=1";

@@ -36,6 +36,7 @@ struct Snapshot {
   bool manual = false;
   bool required = false;
   bool canDownload = false;
+  bool installationFailure = false;
   uint64_t generation = 0;
 };
 
@@ -97,6 +98,8 @@ class Manager {
   std::atomic<bool> cancel_{false};
   std::atomic<bool> installRequestReady_{false};
   std::atomic<unsigned> downloadProgress_{0};
+  std::atomic<unsigned> checkCompletion_{0};
+  unsigned failedAutomaticChecks_ = 0;
   uint64_t optionalSnoozeUntilMs_ = 0;
   uint64_t nextAutomaticCheckMs_ = 0;
   bool peerRequirementHandled_ = false;

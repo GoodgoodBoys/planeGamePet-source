@@ -41,6 +41,10 @@
 #undef main
 #undef private
 
+#include "dnd_server_cases.h"
+#include "motion_server_cases.h"
+#include "battle_server_cases.h"
+
 int main(int argc, char **argv) {
   if (argc != 2) return 2;
   Config config;
@@ -66,5 +70,7 @@ int main(int argc, char **argv) {
   server.Tick();
   if (server.FindBinding(42) != nullptr || server.FindBinding(43) == nullptr) return 4;
   std::puts("UNCONFIRMED_PAIR_EXPIRES_CONFIRMED_PAIR_PRESERVED_OK");
-  return 0;
+  const auto dndResult = RunDndServerCases(server);
+  const auto motionResult = dndResult ? dndResult : RunMotionServerCases(server);
+  return motionResult ? motionResult : RunBattleServerCases(server);
 }

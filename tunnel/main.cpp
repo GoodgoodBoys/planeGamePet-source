@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "../common/network_status.h"
 
 #ifndef PCPET_PUBLIC_URL
 #define PCPET_PUBLIC_URL L"wss://8.166.124.212:32112/v1/tunnel"
@@ -66,6 +67,8 @@ std::filesystem::path LogPath(const std::wstring &instance) {
 }
 
 std::filesystem::path gLogPath;
+plane_pet_network::State gNetworkState = plane_pet_network::State::Starting;
+unsigned gNetworkError = 0;
 
 void LogStatus(const char *stage, DWORD error = 0) {
   static std::mutex logMutex;
@@ -75,6 +78,25 @@ void LogStatus(const char *stage, DWORD error = 0) {
                                          : gLogPath;
   std::error_code directoryError;
   std::filesystem::create_directories(path.parent_path(), directoryError);
+  using State = plane_pet_network::State;
+  const std::string step(stage);
+  if (step == "connected") gNetworkState = State::Connected;
+  else if (step == "connecting") gNetworkState = State::Connecting;
+  else if (step == "local_bind_failed") gNetworkState = State::PortBusy;
+  else if (step == "credential_failed") gNetworkState = State::CredentialError;
+  else if (step == "enrollment_capacity") gNetworkState = State::CapacityFull;
+  else if (step == "enrollment_rate_limit" || error == 429) gNetworkState = State::RateLimited;
+  else if (step == "handshake_status_failed" && (error == 401 || error == 403)) gNetworkState = State::CredentialError;
+  else if (step == "handshake_status_failed" && error == 503) gNetworkState = State::ServiceUnavailable;
+  else if (error == 407 || error == ERROR_WINHTTP_LOGIN_FAILURE) gNetworkState = State::ProxyError;
+  else if (error == ERROR_WINHTTP_SECURE_FAILURE) gNetworkState = State::TlsError;
+  else if (step == "receive_closed") gNetworkState = State::Disconnected;
+  else if (step != "heartbeat") gNetworkState = State::NetworkError;
+  if (step != "heartbeat") gNetworkError = error;
+  auto statusPath = path;
+  statusPath.replace_extension(L".status");
+  plane_pet_network::Write(statusPath, gNetworkState, gNetworkError);
+  if (step == "heartbeat") return;  // freshness without growing the log
   HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ,
                             nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (file == INVALID_HANDLE_VALUE) return;
@@ -251,9 +273,9 @@ ParsedUrl ParseSecureWebSocketUrl(const std::wstring &url) {
 
 class Tunnel {
  public:
-  Tunnel(std::wstring url, std::wstring token, uint16_t localPort)
+  Tunnel(std::wstring url, std::wstring token, uint16_t localPort, bool enroll = true)
       : url_(std::move(url)), token_(std::move(token)),
-        localPort_(localPort) {}
+        localPort_(localPort), allowEnrollment_(enroll) {}
 
   int Run() {
     if (token_.size() < 32 || !ParseSecureWebSocketUrl(url_).valid) {
@@ -277,11 +299,27 @@ class Tunnel {
     if (ioctlsocket(localSocket_, FIONBIO, &nonBlocking) != 0) return 6;
 
     auto reconnectAt = Clock::now();
+    auto nextHeartbeat = Clock::now();
+    unsigned failures = 0;
     while (running_) {
       ReceiveLocal();
       if (!connected_ && Clock::now() >= reconnectAt) {
         CleanupConnection();
-        if (!Connect()) reconnectAt = Clock::now() + std::chrono::seconds(2);
+        if (!Connect()) {
+          const unsigned jitter = static_cast<unsigned>(GetTickCount64()) ^ GetCurrentProcessId();
+          reconnectAt = Clock::now() + std::chrono::milliseconds(
+              std::max(plane_pet_network::RetryMilliseconds(failures, jitter), retryFloorMs_));
+          failures = std::min(failures + 1, 5U);
+        } else {
+          failures = 0;
+          // Even a server that accepts and immediately closes cannot cause a
+          // rapid successful-handshake reconnect storm.
+          reconnectAt = Clock::now() + std::chrono::milliseconds(1500);
+        }
+      }
+      if (Clock::now() >= nextHeartbeat) {
+        LogStatus("heartbeat");
+        nextHeartbeat = Clock::now() + std::chrono::seconds(10);
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
@@ -293,12 +331,18 @@ class Tunnel {
 
  private:
   bool Connect() {
+    LogStatus("connecting");
+    retryFloorMs_ = 0;
     const ParsedUrl parsed = ParseSecureWebSocketUrl(url_);
     if (!parsed.valid) {
       LogStatus("url_invalid");
       return false;
     }
     session_ = WinHttpOpen(L"PlanePetTunnel/1.0.0",
+                           // Preserve the game's original direct ECS route.
+                           // Automatically inheriting a desktop HTTP proxy can
+                           // detour every real-time input/snapshot by >900 ms.
+                           // This is per-session and never changes OS settings.
                            WINHTTP_ACCESS_TYPE_NO_PROXY,
                            WINHTTP_NO_PROXY_NAME,
                            WINHTTP_NO_PROXY_BYPASS, 0);
@@ -320,6 +364,14 @@ class Tunnel {
       LogStatus("request_open_failed", GetLastError());
       return false;
     }
+    DWORD redirects = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
+    if (!WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY,
+                         &redirects, sizeof(redirects))) {
+      const DWORD failure = GetLastError();
+      WinHttpCloseHandle(request);
+      LogStatus("redirect_policy_failed", failure);
+      return false;
+    }
     if (!WinHttpSetOption(request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET,
                           nullptr, 0)) {
       WinHttpCloseHandle(request);
@@ -337,7 +389,7 @@ class Tunnel {
       LogStatus("authorization_header_failed", error);
       return false;
     }
-    if (!WinHttpAddRequestHeaders(
+    if (allowEnrollment_ && !WinHttpAddRequestHeaders(
             request, enrollment.c_str(), static_cast<DWORD>(-1),
             WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE)) {
       const DWORD error = GetLastError();
@@ -365,8 +417,23 @@ class Tunnel {
             WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
             WINHTTP_NO_HEADER_INDEX) ||
         status != 101) {
+      wchar_t reason[80]{};
+      DWORD reasonSize = sizeof(reason);
+      WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, L"X-Plane-Pet-Error",
+                          reason, &reasonSize, WINHTTP_NO_HEADER_INDEX);
+      wchar_t retry[24]{};
+      DWORD retrySize = sizeof(retry);
+      if (WinHttpQueryHeaders(request, WINHTTP_QUERY_CUSTOM, L"Retry-After",
+                              retry, &retrySize, WINHTTP_NO_HEADER_INDEX)) {
+        wchar_t *end = nullptr;
+        const auto seconds = std::wcstoul(retry, &end, 10);
+        if (end != retry && *end == L'\0')
+          retryFloorMs_ = static_cast<unsigned>(std::min(seconds, 3600UL) * 1000UL);
+      }
       WinHttpCloseHandle(request);
-      LogStatus("handshake_status_failed", status);
+      LogStatus(wcscmp(reason, L"enrollment_capacity") == 0 ? "enrollment_capacity" :
+                wcscmp(reason, L"enrollment_rate_limit") == 0 ? "enrollment_rate_limit" :
+                "handshake_status_failed", status);
       return false;
     }
     webSocket_ = WinHttpWebSocketCompleteUpgrade(request, 0);
@@ -401,6 +468,7 @@ class Tunnel {
           webSocket_, WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE,
           bytes, static_cast<DWORD>(received));
       if (error != NO_ERROR) {
+        LogStatus("receive_closed", error);
         connected_ = false;
         WinHttpWebSocketShutdown(
             webSocket_, WINHTTP_WEB_SOCKET_ENDPOINT_TERMINATED_CLOSE_STATUS,
@@ -465,6 +533,8 @@ class Tunnel {
   std::wstring url_;
   std::wstring token_;
   uint16_t localPort_ = 32110;
+  unsigned retryFloorMs_ = 0;
+  bool allowEnrollment_ = true;
   SOCKET localSocket_ = INVALID_SOCKET;
   HINTERNET session_ = nullptr;
   HINTERNET connection_ = nullptr;
@@ -498,6 +568,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
   std::wstring token = Option(L"token", L"");
   if (token.empty()) {
     if (!LoadOrCreateCredential(CredentialPath(instance), token)) {
+      LogStatus("credential_failed", GetLastError());
       ReleaseMutex(mutex);
       CloseHandle(mutex);
       return 11;
@@ -507,7 +578,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     CloseHandle(mutex);
     return 13;
   }
-  Tunnel tunnel(url, token, localPort);
+  Tunnel tunnel(url, token, localPort, Option(L"enroll", L"1") == L"1");
   const int result = tunnel.Run();
   ReleaseMutex(mutex);
   CloseHandle(mutex);

@@ -28,7 +28,8 @@ bool RunUpdateWindowSelfTest(HWND owner) {
     SendMessageW(gUpdateWindow, WM_LBUTTONUP, 0, point);
   };
   for (int attempt = 0; attempt < 6; ++attempt) {
-    gClient.ManualUpdateCheck();
+    // Same command route used after closing the native second-level menu.
+    DispatchPetMenuCommand(owner, kMenuCheckUpdate);
     record("manual_open", gUpdateWindow != nullptr &&
                            IsWindowVisible(gUpdateWindow));
     // The invalid test URL is rejected locally: no public request is sent.

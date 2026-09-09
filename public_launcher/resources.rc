@@ -1,4 +1,8 @@
 1 ICON "assets/plane_pet.ico"
+#include "../dist/PlanePetVersion.rc"
+204 RCDATA "dist/PlanePetRuntimeNotices.txt"
+205 RCDATA "PRIVACY.md"
+206 RCDATA "release/channel.txt"
 201 RCDATA "dist/PlanePetTunnel.exe"
 202 RCDATA "dist/PlanePetClient.exe"
 203 RCDATA "dist/PlanePetUpdater.exe"

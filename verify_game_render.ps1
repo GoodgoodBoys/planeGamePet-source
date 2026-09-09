@@ -33,7 +33,7 @@ finally {
 if ($LASTEXITCODE -ne 0) {
     throw "Render self-test build failed with exit code $LASTEXITCODE"
 }
-$process = Start-Process -FilePath $testExe -ArgumentList @(
+$process = Start-Process -FilePath $testExe -WindowStyle Hidden -ArgumentList @(
     "--render-fixture=$Output", "--telemetry=0"
 ) -WorkingDirectory $dist -Wait -PassThru
 if ($process.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $Output)) {

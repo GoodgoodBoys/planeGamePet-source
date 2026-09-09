@@ -13,7 +13,9 @@ import json
 import ipaddress
 import logging
 import os
+import re
 import socket
+import secrets
 import sqlite3
 import statistics
 import struct
@@ -54,6 +56,9 @@ MAX_CONNECTIONS_PER_INSTALL = 2
 MAX_FRAME = 4096
 MAX_TELEMETRY_FRAME = 768
 MAX_TELEMETRY_EVENTS_PER_MINUTE = 240
+# 180 seconds of simulation plus the bounded confirmation window and one
+# broadcast interval. Reject corrupt durations, not legitimate v3 final ACKs.
+MAX_GAME_WALL_DURATION_MS = 182000
 TELEMETRY_MAGIC = b"PPTELEM1\n"
 WEBSOCKET_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
@@ -81,6 +86,8 @@ ALLOWED_EVENTS = frozenset({
     "peer_version_mismatch", "peer_version_compatible",
     "forced_update_required",
     "usage_started", "usage_heartbeat", "usage_ended",
+    "invite_blocked_dnd", "invite_interrupted_dnd",
+    "dnd_usage_started", "dnd_usage_heartbeat", "dnd_usage_ended",
 })
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -90,6 +97,9 @@ active_lock = asyncio.Lock()
 telemetry_db = None
 telemetry_service = None
 last_telemetry_prune = 0.0
+telemetry_write_failures = 0
+readiness_cache = (0.0, False)
+readiness_lock = None
 
 
 def address_bucket(address: str) -> str:
@@ -175,6 +185,10 @@ def open_telemetry_store(path: Path = TELEMETRY_STORE):
         CREATE INDEX IF NOT EXISTS telemetry_session
             ON telemetry_events(installation_id, session_id);
     """)
+    # Additive migration: old events retain their historical interpretation.
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(telemetry_events)')}
+    if 'release_epoch' not in columns:
+        connection.execute('ALTER TABLE telemetry_events ADD COLUMN release_epoch INTEGER NOT NULL DEFAULT 0')
     connection.commit()
     return connection
 
@@ -198,6 +212,9 @@ def parse_telemetry(payload: bytes):
     event_id = item.get("q")
     client_at = item.get("t")
     value = item.get("x")
+    epoch = item.get("g", 0)
+    if type(epoch) is not int or epoch not in (0, 1):
+        return None
     if (not isinstance(event, str) or event not in ALLOWED_EVENTS or not isinstance(version, str) or
             not version or len(version) > 16 or
             any(ch not in "0123456789." for ch in version) or
@@ -212,11 +229,11 @@ def parse_telemetry(payload: bytes):
             not _valid_hex_id(item.get("r"))):
         return None
     return (item["s"], event_id, client_at, version, item["i"], item["r"],
-            event, value)
+            event, value, epoch)
 
 
 def store_telemetry(digest: str, payload: bytes, received_at_ms=None) -> bool:
-    global last_telemetry_prune
+    global last_telemetry_prune, telemetry_write_failures
     if telemetry_db is None:
         return False
     event = parse_telemetry(payload)
@@ -227,12 +244,13 @@ def store_telemetry(digest: str, payload: bytes, received_at_ms=None) -> bool:
         cursor = telemetry_db.execute(
             """INSERT OR IGNORE INTO telemetry_events
                (installation_id, session_id, event_id, received_at_ms,
-                client_at_ms, app_version, invite_id, round_id, event, value)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                client_at_ms, app_version, invite_id, round_id, event, value, release_epoch)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (digest[:24], event[0], event[1], now_ms, *event[2:]))
         telemetry_db.commit()
         inserted = cursor.rowcount == 1
     except sqlite3.Error:
+        telemetry_write_failures += 1
         telemetry_db.rollback()
         logging.exception("telemetry database write failed")
         return False
@@ -310,6 +328,14 @@ def analytics_snapshot(now_ms=None):
             observed = max(0, min(int(last) - int(first), duration_cap))
         durations.append(observed)
     total_usage = sum(durations)
+    # Cumulative consent-enabled running time only. Old sessions lacking this
+    # counter contribute no inferred DND duration; duplicate/out-of-order events
+    # cannot inflate it. Do not change the database schema or historical rows.
+    dnd_durations = telemetry_db.execute(
+        """SELECT MAX(value) FROM telemetry_events
+           WHERE event IN ('dnd_usage_started','dnd_usage_heartbeat','dnd_usage_ended')
+           GROUP BY installation_id, session_id""").fetchall()
+    dnd_usage = sum(max(0, min(int(row[0]), duration_cap)) for row in dnd_durations)
     median_usage = int(statistics.median(durations)) if durations else 0
     started_rounds = {row[0] for row in telemetry_db.execute(
         """SELECT DISTINCT round_id FROM telemetry_events
@@ -319,18 +345,60 @@ def analytics_snapshot(now_ms=None):
         "SELECT DISTINCT round_id FROM telemetry_events WHERE event='game_started'")}
     finished_rounds = {row[0] for row in telemetry_db.execute(
         "SELECT DISTINCT round_id FROM telemetry_events WHERE event='game_finished'")}
-    completed_rounds = started_rounds & finished_rounds
+    reasons = {}
+    legacy_finished, connection_lost, abandoned = set(), set(), set()
+    for round_id, event, value, version, epoch in telemetry_db.execute(
+            """SELECT round_id, event, value, app_version, release_epoch FROM telemetry_events
+               WHERE round_id!='0000000000000000' AND event IN
+               ('game_finished','game_end_reason','game_connection_lost','game_abandoned')"""):
+        if event == 'game_end_reason':
+            reasons.setdefault(round_id, set()).add(int(value))
+        elif event == 'game_finished' and epoch == 0 and re.fullmatch(r'[0-2]\.\d+\.\d+', version):
+            legacy_finished.add(round_id)
+        elif event == 'game_connection_lost':
+            connection_lost.add(round_id)
+        elif event == 'game_abandoned':
+            abandoned.add(round_id)
+    # MatchEndReason: 1 destroyed, 2 time-limit draw, 3 exit/disconnect,
+    # 4 server/synchronization failure. Terminal evidence outranks a client's
+    # later timeout. Conflicting terminal reasons never become a normal finish.
+    normal = {r for r, values in reasons.items() if values and values <= {1, 2}}
+    abnormal = {r for r, values in reasons.items() if 4 in values}
+    disconnected = {r for r, values in reasons.items() if 3 in values} - abnormal
+    known_terminal = normal | abnormal | disconnected
+    aborted_rounds = started_rounds & (abnormal | (connection_lost - known_terminal))
+    exited_rounds = (started_rounds & (disconnected | (abandoned - known_terminal))) - aborted_rounds
+    # Preserve historical clients lacking reasons, but label their uncertainty.
+    # Current clients with a missing reason stay unclassified until it arrives.
+    legacy_rounds = (legacy_finished - set(reasons) - connection_lost - abandoned) & started_rounds
+    completed_rounds = (started_rounds & finished_rounds & normal) | legacy_rounds
     games_started = len(started_rounds)
     games_completed = len(completed_rounds)
-    invites = _distinct("invite_id", "invite_waiting")
-    accepted = _distinct("invite_id", "invite_accepted_by_peer")
+    def invite_ids(event):
+        return {row[0] for row in telemetry_db.execute(
+            "SELECT DISTINCT invite_id FROM telemetry_events "
+            "WHERE event=? AND invite_id!='0000000000000000'", (event,))}
+    sent_invites = invite_ids("invite_waiting")
+    accepted_invites = invite_ids("invite_accepted_by_peer")
+    rejected_invites = invite_ids("invite_rejected_by_peer")
+    dnd_interrupted = invite_ids("invite_interrupted_dnd")
+    # Legacy auto-rejection is evidence of DND but not the newer atomic outcome.
+    legacy_dnd = invite_ids("invite_auto_rejected_dnd") - dnd_interrupted
+    explicit_dnd = dnd_interrupted | legacy_dnd
+    rejected_invites -= explicit_dnd
+    timed_out_invites = invite_ids("invite_timed_out")
+    invites = len(sent_invites)
+    accepted = len(sent_invites & accepted_invites)
+    eligible_invites = sent_invites - (explicit_dnd - accepted_invites)
+    orphan_results = len((accepted_invites | rejected_invites | timed_out_invites)
+                         - sent_invites)
     game_durations = [(int(value) if round_id in playing_rounds else 0)
                       for round_id, value in telemetry_db.execute(
         """SELECT round_id, MAX(value) FROM telemetry_events
            WHERE event='game_finished' AND round_id!='0000000000000000'
            GROUP BY round_id""").fetchall()
                       if round_id in completed_rounds and value is not None
-                      and (round_id not in playing_rounds or 0 <= int(value) <= 180000)]
+                      and (round_id not in playing_rounds or 0 <= int(value) <= MAX_GAME_WALL_DURATION_MS)]
 
     daily_rows = telemetry_db.execute(
         """SELECT received_at_ms, installation_id, session_id, event, round_id
@@ -352,12 +420,12 @@ def analytics_snapshot(now_ms=None):
         })
 
     recent = []
-    for received, installation, event, value, version in telemetry_db.execute(
-            """SELECT received_at_ms, installation_id, event, value, app_version
+    for received, installation, event, value, version, epoch in telemetry_db.execute(
+            """SELECT received_at_ms, installation_id, event, value, app_version, release_epoch
                FROM telemetry_events ORDER BY id DESC LIMIT 40""").fetchall():
         when = dt.datetime.fromtimestamp(received / 1000, CHINA_TZ)
         recent.append((when.strftime("%m-%d %H:%M:%S"), installation[:8] + "…",
-                       event, value, version))
+                       event, value, ('正式 ' if epoch == 1 else '测试 ') + version))
     distinct_installs = int(telemetry_db.execute(
         "SELECT COUNT(DISTINCT installation_id) FROM telemetry_events").fetchone()[0])
     active = int(telemetry_db.execute(
@@ -378,21 +446,37 @@ def analytics_snapshot(now_ms=None):
         """SELECT COUNT(DISTINCT installation_id) FROM telemetry_events
            WHERE event='quick_emote_sent'""").fetchone()[0])
     return {
+        "capacity_limit": MAX_ENROLLMENTS,
+        "capacity_remaining": max(0, MAX_ENROLLMENTS - len(TOKENS)),
+        "telemetry_write_failures": telemetry_write_failures,
         "enrolled": len(TOKENS), "consenting_installs": distinct_installs,
         "active": active, "dau": dau, "wau": wau,
         "sessions": len(sessions), "total_usage": total_usage,
         "median_usage": median_usage, "pairing_started": _count("pairing_started"),
         "pairing_matched": _count("pairing_matched"), "invites": invites,
         "accepted": accepted,
-        "rejected": _distinct("invite_id", "invite_rejected_by_peer"),
-        "timed_out": _distinct("invite_id", "invite_timed_out"),
+        "rejected": len(sent_invites & rejected_invites),
+        "timed_out": len(sent_invites & timed_out_invites),
+        "invite_orphan_results": orphan_results,
         "invite_acceptance": accepted * 100 // invites if invites else 0,
+        "dnd_blocked": _count("invite_blocked_dnd"),
+        "dnd_interrupted": len(dnd_interrupted),
+        "dnd_legacy_auto_rejected": len(legacy_dnd),
+        "dnd_usage": dnd_usage, "dnd_measured_sessions": len(dnd_durations),
+        "dnd_adjusted_invites": len(eligible_invites),
+        "dnd_adjusted_acceptance": accepted * 100 // len(eligible_invites) if eligible_invites else 0,
         "games_started": games_started, "games_completed": games_completed,
+        "games_aborted": len(aborted_rounds), "games_exited": len(exited_rounds),
+        "games_legacy_unclassified": len(legacy_rounds),
+        "games_unclassified": len((started_rounds & finished_rounds) -
+            completed_rounds - aborted_rounds - exited_rounds),
         "game_completion": games_completed * 100 // games_started if games_started else 0,
         "game_average": sum(game_durations) // len(game_durations)
                         if game_durations else 0,
-        "wins": _distinct("round_id", "game_outcome", 1),
-        "draws": _distinct("round_id", "game_outcome", 0),
+        "wins": len(completed_rounds & {row[0] for row in telemetry_db.execute(
+            "SELECT DISTINCT round_id FROM telemetry_events WHERE event='game_outcome' AND value=1")}),
+        "draws": len(completed_rounds & {row[0] for row in telemetry_db.execute(
+            "SELECT DISTINCT round_id FROM telemetry_events WHERE event='game_outcome' AND value=0")}),
         "emotes_sent": _count("quick_emote_sent"),
         "emotes_received": _count("quick_emote_received"),
         "emote_users": emote_users, "emote_counts": emote_counts,
@@ -416,10 +500,17 @@ def render_admin_page() -> bytes:
         ("启动会话", data["sessions"]), ("累计使用", _format_duration(data["total_usage"])),
         ("会话中位时长", _format_duration(data["median_usage"])),
         ("登记凭据", data["enrolled"]), ("开始匹配", data["pairing_started"]),
+        ("剩余测试名额", data["capacity_remaining"]),
+        ("统计写入失败（本次运行）", data["telemetry_write_failures"]),
+        ("当前连接", active_connections),
+        ("连接上限", MAX_CONNECTIONS),
+        ("统计队列丢弃（本次运行）", telemetry_service.dropped if telemetry_service else 0),
         ("匹配成功", data["pairing_matched"]), ("发出邀请", data["invites"]),
         ("邀请接受率", f'{data["invite_acceptance"]}%'),
         ("开始对局", data["games_started"]), ("完成对局", data["games_completed"]),
         ("对局完成率", f'{data["game_completion"]}%'),
+        ("异常中止", data["games_aborted"]), ("退出／掉线结束", data["games_exited"]),
+        ("结束原因待确认", data["games_unclassified"]),
         ("平均对局时长", _format_duration(data["game_average"])),
         ("快捷表情发送", data["emotes_sent"]),
         ("快捷表情用户", data["emote_users"]),
@@ -453,10 +544,11 @@ def render_admin_page() -> bytes:
 <h1>Plane Pet 匿名测试统计</h1><div class="sub">生成时间：{generated}（北京时间） · 每 60 秒自动刷新</div>
 <div class="grid">{card_html}</div>
 <section><h2>最近 7 天</h2><table><thead><tr><th>日期</th><th>用户</th><th>启动会话</th><th>完成对局</th></tr></thead><tbody>{daily_html}</tbody></table></section>
-<section><h2>邀请结果</h2><p>接受 {data['accepted']} · 拒绝 {data['rejected']} · 超时 {data['timed_out']} · 胜局 {data['wins']} · 平局 {data['draws']}</p></section>
+<section><h2>邀请结果</h2><p>接受 {data['accepted']} · 拒绝 {data['rejected']} · 超时 {data['timed_out']} · 胜局 {data['wins']} · 平局 {data['draws']}</p><p>接受率仅计算有发出记录的同一批邀请；缺少发出记录的结果 {data['invite_orphan_results']} 条，不纳入比例。关闭统计、漏报或保留期边界会造成样本不完整，不能将其当作拒绝。</p></section>
 <section><h2>快捷表情</h2><p>发送 {data['emotes_sent']} · 好友端收到 {data['emotes_received']} · 使用人数 {data['emote_users']}</p><p>{emote_html}</p></section>
+<section><h2>勿扰模式</h2><p>邀请前拦截 {data['dnd_blocked']} 次 · 等待中被勿扰终止 {data['dnd_interrupted']} 次 · 旧版明确自动拒收 {data['dnd_legacy_auto_rejected']} 次</p><p>已授权运行期间的勿扰时长 {_format_duration(data['dnd_usage'])}（{data['dnd_measured_sessions']} 个有计时数据的会话）。未运行、未授权以及旧版缺失的时长不推算。</p><p>原邀请接受率不变；另列排除明确勿扰终止的接受率 {data['dnd_adjusted_acceptance']}%，分母 {data['dnd_adjusted_invites']} 次。邀请前拦截从未进入等待，不计为真实邀请或主动拒绝。旧版未标明原因的历史拒绝保持原分类；双方上报缺失时不能推断原因。</p></section>
 <section><h2>最近匿名事件</h2><table><thead><tr><th>时间</th><th>匿名安装</th><th>事件</th><th>数值</th><th>版本</th></tr></thead><tbody>{recent_html}</tbody></table></section>
-<section class="note">仅统计明确同意上传的客户端。新版使用时长只累计启用统计期间，由 60 秒心跳及停止/退出事件估算；旧版按实际收到事件的时间范围估算。异常断电可能产生少量误差。开始对局包括已接受邀请的倒数，倒数中断的战斗时长为 0；完成率只计算有开局记录的对局。原始匿名事件保留 {TELEMETRY_RETENTION_DAYS} 天，过期不再展示，每分钟自动清理。不采集匹配码、姓名、键鼠轨迹、屏幕内容或窗口标题。</section>
+<section class="note">仅统计明确同意上传的客户端。新版使用时长只累计启用统计期间，由 60 秒心跳及停止/退出事件估算；旧版按实际收到事件的时间范围估算。异常断电可能产生少量误差。开始对局包括已接受邀请的倒数；完成率与平均时长不计异常中止或退出／掉线结束。平均时长使用正常完成对局的实际战斗时间（含确认等待，允许至 182 秒）。旧版缺少结束原因的 {data['games_legacy_unclassified']} 局保留原完成口径，不代表已确认正常结束；当前版本漏报原因单列待确认。双方上报按对局去重，迟到的服务器结算可更正先前断线分类。原始匿名事件保留 {TELEMETRY_RETENTION_DAYS} 天，过期不再展示，每分钟自动清理。不采集匹配码、姓名、键鼠轨迹、屏幕内容或窗口标题。</section>
 </div></body></html>"""
     return document.encode("utf-8")
 
@@ -598,6 +690,47 @@ async def bridge(reader, writer, installation_digest: str) -> None:
         logging.info("tunnel closed install=%s", installation_digest[:8])
 
 
+async def probe_backend():
+    """Non-mutating authenticated-by-local-boundary UDP readiness probe."""
+    global readiness_cache, readiness_lock
+    if readiness_lock is None:
+        readiness_lock = asyncio.Lock()
+    async with readiness_lock:
+        now = time.monotonic()
+        if now - readiness_cache[0] < 5:
+            return readiness_cache[1]
+        nonce = secrets.token_bytes(16)
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.setblocking(False)
+        ok = False
+        try:
+            if not ipaddress.ip_address(UDP_HOST).is_loopback:
+                return False
+            udp.connect((UDP_HOST, UDP_PORT))
+            loop = asyncio.get_running_loop()
+            await loop.sock_sendall(udp, b"PPPROBE1" + nonce)
+            reply = await asyncio.wait_for(loop.sock_recv(udp, 64), .75)
+            ok = reply == b"PPREADY1" + nonce
+        except (OSError, asyncio.TimeoutError):
+            pass
+        finally:
+            udp.close()
+        readiness_cache = (time.monotonic(), ok)
+        return ok
+
+
+def runtime_status():
+    return {
+        "connections": active_connections, "connection_limit": MAX_CONNECTIONS,
+        "enrollments": len(TOKENS), "enrollment_limit": MAX_ENROLLMENTS,
+        "enrollment_remaining": max(0, MAX_ENROLLMENTS - len(TOKENS)),
+        "capacity_warning": len(TOKENS) >= MAX_ENROLLMENTS * .8,
+        "telemetry_queue": telemetry_service.queue.qsize() if telemetry_service else 0,
+        "telemetry_dropped": telemetry_service.dropped if telemetry_service else 0,
+        "telemetry_write_failures": telemetry_write_failures,
+    }
+
+
 async def handle_client(reader, writer) -> None:
     global active_connections
     peer = writer.get_extra_info("peername")
@@ -614,6 +747,24 @@ async def handle_client(reader, writer) -> None:
                 client_ip = str(ipaddress.ip_address(forwarded))
         if method == "GET" and path == "/healthz":
             await send_http(writer, "200 OK", b"ok\n")
+            return
+        if method == "GET" and path == "/readyz":
+            # Not published through Nginx. Proxied external requests cannot
+            # masquerade as the local monitor through X-Forwarded-For.
+            if not peer or not ipaddress.ip_address(client_ip).is_loopback:
+                await send_http(writer, "404 Not Found", b"not found\n")
+                return
+            ready = await probe_backend()
+            await send_http(writer, "200 OK" if ready else "503 Service Unavailable",
+                            b"ready\n" if ready else b"backend unavailable\n")
+            return
+        if method == "GET" and path == "/admin/status":
+            if not admin_authorized(headers):
+                await send_http(writer, "401 Unauthorized", b"authentication required\n")
+            else:
+                status = runtime_status()
+                status["backend_ready"] = await probe_backend()
+                await send_http(writer, "200 OK", json.dumps(status).encode(), "application/json")
             return
         if method == "GET" and path == "/admin":
             if not ADMIN_PASSWORD:
@@ -651,7 +802,8 @@ async def handle_client(reader, writer) -> None:
         async with active_lock:
             if (active_connections >= MAX_CONNECTIONS or
                     active_installations.get(digest, 0) >= MAX_CONNECTIONS_PER_INSTALL):
-                await send_http(writer, "503 Service Unavailable", b"connection limit\n")
+                await send_http(writer, "503 Service Unavailable", b"connection limit\n",
+                                extra_headers=("X-Plane-Pet-Error: connection_limit", "Retry-After: 30"))
                 return
             known = any(hmac.compare_digest(digest, stored) for stored in TOKENS)
             if not known:
@@ -661,10 +813,16 @@ async def handle_client(reader, writer) -> None:
                                        if str(created).isdigit() and
                                        now_seconds - int(created) < ENROLLMENT_WINDOW_SECONDS and
                                        hmac.compare_digest(address, client_bucket))
-                if (headers.get("x-plane-pet-enroll") != "1" or
-                        len(TOKENS) >= MAX_ENROLLMENTS or
-                        enrolled_from_ip >= MAX_ENROLLMENTS_PER_IP):
+                if headers.get("x-plane-pet-enroll") != "1":
                     await send_http(writer, "403 Forbidden", b"enrollment denied\n")
+                    return
+                if len(TOKENS) >= MAX_ENROLLMENTS:
+                    await send_http(writer, "503 Service Unavailable", b"enrollment capacity\n",
+                                    extra_headers=("X-Plane-Pet-Error: enrollment_capacity", "Retry-After: 300"))
+                    return
+                if enrolled_from_ip >= MAX_ENROLLMENTS_PER_IP:
+                    await send_http(writer, "429 Too Many Requests", b"enrollment rate limit\n",
+                                    extra_headers=("X-Plane-Pet-Error: enrollment_rate_limit", "Retry-After: 300"))
                     return
                 updated = dict(TOKENS)
                 updated[digest] = (str(now_seconds), client_bucket)

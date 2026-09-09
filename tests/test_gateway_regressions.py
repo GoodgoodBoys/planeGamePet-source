@@ -16,10 +16,10 @@ g = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(g)
 
 
-def packet(event="app_started", q=1, value=0, round_id="0" * 16):
+def packet(event="app_started", q=1, value=0, round_id="0" * 16, invite_id="0" * 16):
     return g.TELEMETRY_MAGIC + json.dumps(dict(
         v=1, s="a" * 16, q=q, t=1000, a="1.0.1",
-        i="0" * 16, r=round_id, e=event, x=value)).encode()
+        i=invite_id, r=round_id, e=event, x=value)).encode()
 
 
 class Writer:
@@ -94,6 +94,38 @@ class GatewayAsyncTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(g, "persist_tokens", side_effect=OSError("test locked store")):
             self.assertIn(b"503", await self.request())
         self.assertEqual(g.TOKENS, {})
+
+    async def test_capacity_denial_preserves_existing_installations(self):
+        with patch.object(g, "MAX_ENROLLMENTS", 1), patch.object(g, "persist_tokens"):
+            self.assertIn(b"101", await self.request(1))
+            original = dict(g.TOKENS)
+            self.assertIn(b"503", await self.request(2))
+            self.assertEqual(g.TOKENS, original)
+            self.assertIn(b"101", await self.request(1))
+            self.assertEqual(g.runtime_status()["enrollment_remaining"], 0)
+
+    async def test_same_ip_registration_rate_limit(self):
+        with patch.object(g, "MAX_ENROLLMENTS_PER_IP", 1), patch.object(g, "persist_tokens"):
+            self.assertIn(b"101", await self.request(1))
+            self.assertIn(b"429", await self.request(2))
+            self.assertIn(b"101", await self.request(1))
+
+    async def test_readiness_rejects_wrong_nonce_and_unavailable_server(self):
+        class Probe(asyncio.DatagramProtocol):
+            def connection_made(self, transport): self.transport = transport
+            def datagram_received(self, data, address):
+                self.transport.sendto(b"PPREADY1" + b"x" * 16, address)
+        transport, _ = await asyncio.get_running_loop().create_datagram_endpoint(
+            Probe, local_addr=("127.0.0.1", 0))
+        g.readiness_cache = (0, False)
+        g.readiness_lock = None
+        try:
+            with patch.object(g, "UDP_PORT", transport.get_extra_info("sockname")[1]):
+                self.assertFalse(await g.probe_backend())
+        finally:
+            transport.close()
+            g.readiness_cache = (0, False)
+            g.readiness_lock = None
 
     async def test_installation_connection_limit(self):
         digest = g.token_digest("Bearer " + f"{1:064x}")
@@ -186,6 +218,36 @@ class GatewayAsyncTest(unittest.IsolatedAsyncioTestCase):
 
 
 class StatsRegressionTest(unittest.TestCase):
+    def test_dnd_results_distinct_and_original_denominator_preserved(self):
+        events = [("invite_waiting", "1"), ("invite_waiting", "2"),
+                  ("invite_accepted_by_peer", "1"), ("invite_interrupted_dnd", "2"),
+                  ("invite_interrupted_dnd", "2"), ("invite_rejected_by_peer", "2"),
+                  ("invite_blocked_dnd", "0"), ("invite_auto_rejected_dnd", "2")]
+        for q, (event, identity) in enumerate(events, 1):
+            self.add(packet(event, q, invite_id=identity * 16))
+        stats = g.analytics_snapshot(self.now)
+        self.assertEqual((stats["invites"], stats["accepted"], stats["invite_acceptance"]), (2, 1, 50))
+        self.assertEqual((stats["dnd_blocked"], stats["dnd_interrupted"], stats["rejected"]), (1, 1, 0))
+        self.assertEqual((stats["dnd_adjusted_invites"], stats["dnd_adjusted_acceptance"]), (1, 100))
+        self.assertEqual(stats["dnd_legacy_auto_rejected"], 0)
+        self.assertIn("勿扰模式", g.render_admin_page().decode())
+
+    def test_dnd_only_counts_measured_consent_segments(self):
+        for q, (event, value) in enumerate((("dnd_enabled", 0), ("usage_ended", 9000),
+                ("dnd_usage_ended", 5000), ("dnd_usage_started", 0),
+                ("dnd_usage_heartbeat", 3000), ("dnd_usage_ended", 6000)), 1):
+            self.add(packet(event, q, value))
+        stats = g.analytics_snapshot(self.now)
+        self.assertEqual((stats["dnd_usage"], stats["dnd_measured_sessions"]), (6000, 1))
+        self.assertEqual(stats["total_usage"], 9000)
+
+    def test_dnd_historical_unattributed_rejection_not_rewritten(self):
+        self.add(packet("invite_waiting", 1, invite_id="1" * 16))
+        self.add(packet("invite_rejected_by_peer", 2, invite_id="1" * 16))
+        self.add(packet("dnd_enabled", 3))
+        stats = g.analytics_snapshot(self.now)
+        self.assertEqual((stats["rejected"], stats["dnd_interrupted"], stats["dnd_usage"]), (1, 0, 0))
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         g.telemetry_db = g.open_telemetry_store(Path(self.temp.name) / "stats.db")
@@ -219,6 +281,34 @@ class StatsRegressionTest(unittest.TestCase):
         self.assertEqual(stats["games_started"], 1)
         self.assertEqual(stats["games_completed"], 1)
         self.assertEqual(stats["game_average"], 0)
+
+    def test_invitation_results_use_same_cohort_and_ignore_zero_ids(self):
+        self.add(packet("invite_waiting", 1, invite_id="1" * 16))
+        self.add(packet("invite_accepted_by_peer", 2, invite_id="1" * 16))
+        self.add(packet("invite_accepted_by_peer", 3, invite_id="2" * 16))
+        self.add(packet("invite_rejected_by_peer", 4, invite_id="3" * 16))
+        self.add(packet("invite_timed_out", 5, invite_id="4" * 16))
+        self.add(packet("invite_waiting", 6))
+        self.add(packet("invite_accepted_by_peer", 7))
+        stats = g.analytics_snapshot(self.now)
+        self.assertEqual((stats["invites"], stats["accepted"],
+                          stats["invite_acceptance"]), (1, 1, 100))
+        self.assertEqual(stats["invite_orphan_results"], 3)
+        self.assertEqual((stats["rejected"], stats["timed_out"]), (0, 0))
+        # Out-of-order arrival heals coverage; duplicate result IDs do not inflate.
+        self.add(packet("invite_waiting", 8, invite_id="2" * 16))
+        self.add(packet("invite_accepted_by_peer", 9, invite_id="2" * 16))
+        stats = g.analytics_snapshot(self.now)
+        self.assertEqual((stats["invites"], stats["accepted"]), (2, 2))
+        self.assertEqual(stats["invite_orphan_results"], 2)
+
+    def test_invite_expiration_never_inflates_rate(self):
+        self.add(packet("invite_waiting", 1, invite_id="1" * 16))
+        self.add(packet("invite_accepted_by_peer", 2, invite_id="1" * 16), 300000)
+        stats = g.analytics_snapshot(self.now + 90 * 86400000 + 1)
+        self.assertEqual((stats["invites"], stats["accepted"],
+                          stats["invite_acceptance"]), (0, 0, 0))
+        self.assertEqual(stats["invite_orphan_results"], 1)
 
 
 if __name__ == "__main__":

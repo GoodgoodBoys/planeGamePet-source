@@ -10,9 +10,17 @@ namespace plane_pet_update {
 // reaches these publication methods through HTTPS, signature/hash validation.
 struct ManagerTestAccess {
   static std::string FutureVersion() {
+    if (plane_pet_version::kPatch == 255)
+      return std::to_string(static_cast<unsigned>(plane_pet_version::kMajor) +
+          (plane_pet_version::kMinor == 255 ? 1U : 0U)) + "." +
+          std::to_string(plane_pet_version::kMinor == 255 ? 0U :
+          static_cast<unsigned>(plane_pet_version::kMinor) + 1U) + ".0";
     return std::to_string(plane_pet_version::kMajor) + "." +
         std::to_string(plane_pet_version::kMinor) + "." +
         std::to_string(static_cast<unsigned>(plane_pet_version::kPatch) + 1U);
+  }
+  static std::string FutureMajorVersion() {
+    return std::to_string(static_cast<unsigned>(plane_pet_version::kMajor) + 1U) + ".0.0";
   }
   static void Seed(Manager &manager, State state, bool manual = true,
                    bool required = false, bool downloadable = false) {
@@ -56,6 +64,9 @@ struct ManagerTestAccess {
   }
   static void MakeAutomaticCheckDue(Manager &manager) {
     manager.nextAutomaticCheckMs_ = 0;
+  }
+  static bool ShortAutomaticRetryScheduled(Manager &manager) {
+    return manager.failedAutomaticChecks_ == 1 && manager.nextAutomaticCheckMs_ != 0;
   }
   static void MarkOptionalPeerHandled(Manager &manager) {
     manager.peerRequirementHandled_ = true;

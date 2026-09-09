@@ -65,6 +65,11 @@ def local_server_probes(temp, server_binary):
     try:
         time.sleep(.3)
         a, b = peer(), peer()
+        nonce = bytes(range(16))
+        a.send(b'PPPROBE1' + nonce)
+        assert recv_until(a, lambda d: d[:8] == b'PPREADY1') == b'PPREADY1' + nonce
+        assert not (temp / 'bindings.db').exists(), 'Readiness probe created persistent identities'
+        print('READINESS_PROBE_NO_IDENTITIES_OK', flush=True)
         a.send(control(1, 101, 1001, 481592))
         assert recv_until(a, lambda d: d[:2] == b'PB')[32] == 1
         b.send(control(1, 102, 1002, 481592))
@@ -153,6 +158,8 @@ def local_server_probes(temp, server_binary):
                 pass
         assert replies == 45, replies
         print(f'INDEPENDENT_CONTROL_QUOTA_OK: 45 distinct UDP endpoints, {replies} replies', flush=True)
+        from dnd_wire_probe import run_dnd_wire
+        run_dnd_wire((port, port))
     finally:
         for sock in peers:
             sock.close()

@@ -60,6 +60,8 @@ try {
     if ($successCode -ne 0 -or
         (Get-FileHash -Algorithm SHA256 -LiteralPath $target).Hash.ToLower() -ne $successHash -or
         (Test-Path -LiteralPath "$target.old") -or
+        -not (Test-Path -LiteralPath "$target.last-good") -or
+        (Get-FileHash -Algorithm SHA256 -LiteralPath "$target.last-good").Hash.ToLower() -ne $successHash -or
         (Test-Path -LiteralPath (Join-Path $data "update.pending"))) {
         $failurePath = Join-Path $data "update.failure"
         $failureText = if (Test-Path -LiteralPath $failurePath) {

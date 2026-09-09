@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -32,6 +33,9 @@ constexpr SOCKET INVALID_SOCKET = -1;
 #endif
 
 #include "../common/pairing_protocol.h"
+#include "../common/pc_motion_protocol.h"
+#include "../common/pc_battle_protocol.h"
+#include "../common/dnd_protocol.h"
 #include "../shared/plane_protocol.h"
 #include "../shared/plane_sim.h"
 
@@ -86,6 +90,14 @@ struct Client {
   uint32_t lastInputSequence = 0;
   uint32_t resumeRequestId = 0;
   uint32_t lastOperationId = 0;
+  bool supportsDnd = false;
+  bool supportsMotion = false;
+  pcmotion::InputQueue motionInputs;
+  Clock::time_point lastMotionProcessed{};
+  bool doNotDisturb = false;
+  uint32_t dndRevision = 0;
+  uint32_t blockedOperation = 0;
+  pcpair::InviteBlock blockedReason = pcpair::InviteBlock::None;
   uint8_t slot = 0;
   uint8_t input = 0;
   Clock::time_point lastSeen{};
@@ -97,12 +109,19 @@ struct Room {
   uint32_t bindingId = 0;
   std::array<Client, 2> clients{};
   plink::WorldState world{};
+  pcmotion::World motion;
+  pcbattle::Authority battle;
+  bool battleEnabled = false;
+  bool motionEnabled = false;
+  bool syncFailed = false;
   plink::GamePhase phase = plink::GamePhase::Menu;
   uint8_t inviterSlot = 0;
   uint8_t winnerSlot = 0;
   plink::MatchEndReason endReason = plink::MatchEndReason::None;
   uint64_t roundId = 0;
   uint64_t inviteId = 0;
+  bool dndInterrupted = false;
+  uint8_t dndInterruptedInviter = 0;
   Clock::time_point phaseStarted{};
   Clock::time_point matchStarted{};
 };
@@ -286,7 +305,7 @@ class PetServer {
       int catchup = 0;
       while (now >= nextTick && catchup < 4) {
         Tick();
-        nextTick += std::chrono::microseconds(33333);
+        nextTick += std::chrono::nanoseconds(1000000000 / pcmotion::kHz);
         ++catchup;
       }
       if (now > nextTick + std::chrono::milliseconds(200)) nextTick = now;
@@ -465,6 +484,7 @@ class PetServer {
     response.pairingCode = request.pairingCode;
     response.bindingId = request.bindingId;
     response.status = status;
+    response.wireVersion = request.wireVersion ? request.wireVersion : pcpair::WireVersionFor(request.appVersion);
     SendControl(endpoint, response);
   }
 
@@ -482,6 +502,7 @@ class PetServer {
     response.status = pcpair::Status::Matched;
     response.assignedSlot = static_cast<uint8_t>(slot + 1);
     response.appVersion = binding.pendingVersion[1 - slot];
+    response.wireVersion = pcpair::WireVersionFor(binding.pendingVersion[slot]);
     response.compatibilityFlags = CompatibilityFlags(
         binding.pendingVersion[slot], binding.pendingVersion[1 - slot]);
     SendControl(endpoint, response);
@@ -489,15 +510,15 @@ class PetServer {
 
   static uint8_t CompatibilityFlags(const pcpair::AppVersion &local,
                                     const pcpair::AppVersion &peer) {
-    uint8_t flags = pcpair::ScopedActionsSupported;
+    uint8_t flags = pcpair::ScopedActionsSupported | pcpair::kDndSupported | pcmotion::kSupported;
     if (!peer.Known()) return flags;
     flags |= pcpair::PeerVersionKnown;
     if (local.Known()) {
       const auto localTuple =
-          std::array<uint8_t, 3>{local.major, local.minor, local.patch};
+          std::array<uint8_t, 4>{local.releaseEpoch, local.major, local.minor, local.patch};
       const auto peerTuple =
-          std::array<uint8_t, 3>{peer.major, peer.minor, peer.patch};
-      if (local.major != peer.major) flags |= pcpair::MajorMismatch;
+          std::array<uint8_t, 4>{peer.releaseEpoch, peer.major, peer.minor, peer.patch};
+      if (!pcpair::SameMajorFamily(local, peer)) flags |= pcpair::MajorMismatch;
       if (localTuple < peerTuple)
         flags |= pcpair::LocalUpdateRequired;
       else if (peerTuple < localTuple)
@@ -519,6 +540,7 @@ class PetServer {
       response.status = pcpair::Status::Matched;
       response.assignedSlot = client.slot;
       response.appVersion = peer.appVersion;
+      response.wireVersion = pcpair::WireVersionFor(client.appVersion);
       response.compatibilityFlags =
           CompatibilityFlags(client.appVersion, peer.appVersion);
       SendControl(client.endpoint, response);
@@ -528,7 +550,7 @@ class PetServer {
   bool MajorVersionsCompatible(const Room &room) const {
     const pcpair::AppVersion &left = room.clients[0].appVersion;
     const pcpair::AppVersion &right = room.clients[1].appVersion;
-    return !left.Known() || !right.Known() || left.major == right.major;
+    return pcpair::SameMajorFamily(left, right);
   }
 
   void RemoveWaiter(uint32_t deviceId, uint32_t requestId = 0) {
@@ -620,6 +642,7 @@ class PetServer {
       firstRequest.deviceId = first.deviceId;
       firstRequest.requestId = first.requestId;
       firstRequest.pairingCode = first.pairingCode;
+      firstRequest.appVersion = first.appVersion;
       SendStatus(first.endpoint, firstRequest, pcpair::Status::StorageError);
       SendStatus(endpoint, message, pcpair::Status::StorageError);
       std::fprintf(stderr, "PAIR_STORE_FAILED devices=%u:%u\n",
@@ -681,6 +704,10 @@ class PetServer {
           EnterMenu(room, "client_restarted_during_invite");
         } else if (room.phase == plink::GamePhase::Countdown ||
                    room.phase == plink::GamePhase::Playing) {
+          if (room.battleEnabled) {
+            // A new process/session is not proof of a voluntary forfeit.
+            EndSyncFailure(room);
+          } else {
           const Client &peer = room.clients[1 - slot];
           const bool peerOnline = peer.active &&
               Clock::now() - peer.lastSeen < std::chrono::seconds(5);
@@ -689,6 +716,7 @@ class PetServer {
           room.endReason = plink::MatchEndReason::PlayerDisconnected;
           room.phase = plink::GamePhase::Finished;
           room.phaseStarted = Clock::now();
+          }
           std::printf("MATCH_END binding=%u reason=client_restarted slot=%u\n",
                       room.bindingId, static_cast<unsigned>(slot + 1));
         }
@@ -705,6 +733,9 @@ class PetServer {
     client.endpoint = endpoint;
     client.lastSeen = Clock::now();
     client.appVersion = message.appVersion;
+    client.supportsDnd = (message.compatibilityFlags & pcpair::kDndSupported) != 0;
+    client.supportsMotion = client.supportsDnd && pcpair::GameProtocolFor(message.appVersion) >= 2 &&
+        (message.compatibilityFlags & pcmotion::kSupported) != 0;
     if (binding->pendingRequest[slot] != 0) {
       const uint32_t pendingRequest = binding->pendingRequest[slot];
       binding->pendingRequest[slot] = 0;
@@ -726,6 +757,15 @@ class PetServer {
     const int slot = binding == nullptr ? -1 : BindingSlot(*binding, message.deviceId);
     if (binding == nullptr || !ValidToken(*binding, slot, message)) return;
     Room &room = GetRoom(binding->id);
+    if (room.phase == plink::GamePhase::Countdown || room.phase == plink::GamePhase::Playing) {
+      // An authenticated, explicit Goodbye retains the voluntary-exit rule.
+      const auto &peer = room.clients[1 - slot];
+      room.winnerSlot = peer.active && Clock::now() - peer.lastSeen < std::chrono::seconds(10)
+          ? static_cast<uint8_t>(2 - slot) : 0;
+      room.endReason = plink::MatchEndReason::PlayerDisconnected;
+      room.phase = plink::GamePhase::Finished;
+      room.phaseStarted = Clock::now();
+    }
     room.clients[slot] = Client{};
     if (room.phase == plink::GamePhase::Waiting) EnterMenu(room, "peer_goodbye");
     std::printf("GOODBYE binding=%u device=%u\n", binding->id,
@@ -897,6 +937,15 @@ class PetServer {
 #endif
         return;
       }
+      // Readiness probe: loopback only, fixed-size echo, no identity, binding,
+      // telemetry or simulation mutation. Public gameplay still uses auth.
+      if (received == 24 && (ntohl(from.sin_addr.s_addr) >> 24U) == 127U &&
+          std::memcmp(bytes, "PPPROBE1", 8) == 0) {
+        std::memcpy(bytes, "PPREADY1", 8);
+        sendto(socket_, reinterpret_cast<const char *>(bytes), received, 0,
+               reinterpret_cast<const sockaddr *>(&from), sizeof(from));
+        continue;
+      }
       pcpair::Message control;
       if (pcpair::Parse(bytes, static_cast<size_t>(received), control,
                         config_.networkKey)) {
@@ -925,10 +974,48 @@ class PetServer {
         continue;
       }
       Client &client = *located.client;
-      if (header.sequence <= client.lastSequence) continue;
-      client.lastSequence = header.sequence;
+      // Tick-tagged v3 inputs are idempotent. A newer ping/packet must not
+      // discard an older datagram that still contains missing simulation ticks.
+      if (header.sequence <= client.lastSequence && header.type != pcbattle::kInputType) continue;
+      client.lastSequence = std::max(client.lastSequence, header.sequence);
       client.lastSeen = Clock::now();
-      if (header.type == plink::PacketType::Input) {
+      if (header.type == pcpair::kDndPreferenceType && client.supportsDnd) {
+        pcpair::DndPreference preference;
+        plink::PayloadReader reader(payload, header.payloadLength);
+        if (pcpair::ReadDndPreference(reader, preference))
+          ApplyDnd(*located.room, client, preference);
+      } else if (header.type == pcbattle::kInputType && client.supportsMotion && pcpair::GameProtocolFor(client.appVersion) == 3) {
+        pcbattle::Batch batch;
+        plink::PayloadReader reader(payload, header.payloadLength);
+        Room &room = *located.room;
+        if (pcbattle::ReadBatch(reader, batch) && room.battleEnabled &&
+            room.phase == plink::GamePhase::Playing && batch.round == room.roundId &&
+            batch.first <= pcbattle::kMaxTicks && batch.count <= pcbattle::kMaxTicks - batch.first + 1) {
+          bool valid = true;
+          // Validate atomically against a copy: no partial malicious batch.
+          auto proposed = room.battle.inputs[client.slot - 1];
+          for (unsigned i = 0; i < batch.count; ++i)
+            valid = proposed.Put(batch.first + i, batch.commands[i], room.battle.world.tick,
+                std::min<uint32_t>(pcbattle::kMaxTicks, room.battle.budget + pcbattle::kFutureAllowance)) && valid;
+          if (valid) room.battle.inputs[client.slot - 1] = proposed;
+          else ++invalidPackets_;
+        } else ++invalidPackets_;
+      } else if (header.type == pcmotion::kInputType && client.supportsMotion && !located.room->battleEnabled) {
+        pcmotion::Batch batch;
+        plink::PayloadReader reader(payload, header.payloadLength);
+        Room &room = *located.room;
+        if (pcmotion::ReadBatch(reader, batch) && room.motionEnabled &&
+            room.phase == plink::GamePhase::Playing && batch.round == room.roundId) {
+          for (unsigned i = 0; i < batch.count; ++i)
+            client.motionInputs.Put(batch.first + i, batch.commands[i]);
+        } else ++invalidPackets_;
+      } else if (header.type == pcmotion::kAbortType && client.supportsMotion) {
+        uint32_t lo = 0, hi = 0;
+        plink::PayloadReader reader(payload, header.payloadLength);
+        if (reader.U32(lo) && reader.U32(hi) && reader.Done() &&
+            (uint64_t(lo) | (uint64_t(hi) << 32)) == located.room->roundId)
+          EndSyncFailure(*located.room);
+      } else if (header.type == plink::PacketType::Input && !client.supportsMotion) {
         plink::InputPayload input;
         plink::PayloadReader reader(payload, header.payloadLength);
         if (!plink::ReadInput(reader, input)) {
@@ -950,7 +1037,7 @@ class PetServer {
               action.context.phase == room.phase &&
               action.context.roundId == room.roundId &&
               action.context.inviteId == room.inviteId) {
-            HandleAction(room, client, action.action);
+            HandleAction(room, client, action.action, action.operationId);
           }
           client.lastOperationId = action.operationId;
           uint8_t ackBytes[plink::kMaxPacketSize]{};
@@ -967,11 +1054,58 @@ class PetServer {
     }
   }
 
-  void HandleAction(Room &room, Client &client, plink::PlayerAction action) {
+  void ApplyDnd(Room &room, Client &client, const pcpair::DndPreference &preference) {
+    if (client.dndRevision == 0 || static_cast<int32_t>(preference.revision - client.dndRevision) > 0) {
+      client.dndRevision = preference.revision;
+      client.doNotDisturb = preference.enabled;
+      if (client.doNotDisturb && room.phase == plink::GamePhase::Waiting &&
+          room.inviterSlot != client.slot) {
+        const auto inviter = room.inviterSlot;
+        EnterMenu(room, "invite_interrupted_dnd", plink::MatchEndReason::InviteRejected);
+        room.dndInterrupted = true;
+        room.dndInterruptedInviter = inviter;
+      }
+    }
+    SendSnapshots(room);
+  }
+
+  void BlockInvite(Room &room, Client &client, uint32_t operation, pcpair::InviteBlock reason) {
+    if (client.supportsDnd) {
+      client.blockedOperation = operation;
+      client.blockedReason = reason;
+      SendSnapshots(room);
+    } else {
+      // Legacy UI understands only Waiting -> Menu/InviteRejected. Send this
+      // feedback to the sender only, without creating a real invitation or
+      // waking the recipient. New clients get the explicit PC-only outcome.
+      Room feedback = room;
+      feedback.clients[client.slot == 1 ? 1 : 0].active = false;
+      feedback.inviterSlot = client.slot;
+      feedback.inviteId = SecureRandomU64();
+      feedback.phase = plink::GamePhase::Waiting;
+      feedback.phaseStarted = Clock::now();
+      feedback.dndInterrupted = false;
+      SendSnapshots(feedback);
+      EnterMenu(feedback, "legacy_invite_unavailable", plink::MatchEndReason::InviteRejected);
+      SendSnapshots(feedback);
+    }
+  }
+
+  void HandleAction(Room &room, Client &client, plink::PlayerAction action, uint32_t operation = 0) {
     const auto now = Clock::now();
     if (!MajorVersionsCompatible(room)) return;
+    // A v2 movement peer must never silently fight under the v1 rules.
+    if (room.clients[0].supportsMotion != room.clients[1].supportsMotion &&
+        (action == plink::PlayerAction::Invite || action == plink::PlayerAction::Accept)) return;
     if (action == plink::PlayerAction::Invite &&
         room.phase == plink::GamePhase::Menu && OnlineMask(room) == 0x03U) {
+      const Client &recipient = room.clients[client.slot == 1 ? 1 : 0];
+      if (recipient.supportsDnd && (recipient.dndRevision == 0 || recipient.doNotDisturb)) {
+        BlockInvite(room, client, operation, recipient.dndRevision == 0
+            ? pcpair::InviteBlock::Synchronizing : pcpair::InviteBlock::DoNotDisturb);
+        return;
+      }
+      room.dndInterrupted = false;
       room.inviterSlot = client.slot;
       room.inviteId = SecureRandomU64();
       room.roundId = 0;
@@ -982,7 +1116,25 @@ class PetServer {
     } else if (action == plink::PlayerAction::Accept &&
                room.phase == plink::GamePhase::Waiting &&
                client.slot != room.inviterSlot) {
+      if (client.supportsDnd && client.doNotDisturb) {
+        const auto inviter = room.inviterSlot;
+        EnterMenu(room, "accept_blocked_dnd", plink::MatchEndReason::InviteRejected);
+        room.dndInterrupted = true;
+        room.dndInterruptedInviter = inviter;
+        SendSnapshots(room);
+        return;
+      }
       plink::InitializeWorld(room.world);
+      room.motion = pcmotion::World{};
+      room.motionEnabled = room.clients[0].supportsMotion && room.clients[1].supportsMotion;
+      room.battle = pcbattle::Authority{};
+      room.battleEnabled = room.motionEnabled && pcpair::GameProtocolFor(room.clients[0].appVersion) == 3 &&
+          pcpair::GameProtocolFor(room.clients[1].appVersion) == 3;
+      room.syncFailed = false;
+      for (auto &member : room.clients) {
+        member.motionInputs = pcmotion::InputQueue{};
+        member.lastMotionProcessed = {};
+      }
       room.roundId = SecureRandomU64();
       room.endReason = plink::MatchEndReason::None;
       room.phase = plink::GamePhase::Countdown;
@@ -1015,9 +1167,28 @@ class PetServer {
     room.inviterSlot = 0;
     room.winnerSlot = 0;
     room.endReason = outcome;
+    room.dndInterrupted = false;
     room.phaseStarted = Clock::now();
     plink::InitializeWorld(room.world);
+    room.motion = pcmotion::World{};
+    room.battle = pcbattle::Authority{};
+    room.battleEnabled = false;
+    room.motionEnabled = false;
+    room.syncFailed = false;
     std::printf("MENU binding=%u reason=%s\n", room.bindingId, reason);
+  }
+
+  void EndSyncFailure(Room &room) {
+    if (!room.motionEnabled || (room.phase != plink::GamePhase::Playing &&
+        !(room.battleEnabled && room.phase == plink::GamePhase::Countdown))) return;
+    room.syncFailed = true;
+    room.winnerSlot = 0;
+    room.endReason = plink::MatchEndReason::ServerUnavailable;
+    room.phase = plink::GamePhase::Finished;
+    room.phaseStarted = Clock::now();
+    std::printf("SYNC_ENDED binding=%u round=%llu\n", room.bindingId,
+        static_cast<unsigned long long>(room.roundId));
+    SendSnapshots(room);
   }
 
   void TickRoom(Room &room, const Clock::time_point &now) {
@@ -1040,11 +1211,17 @@ class PetServer {
     if ((room.phase == plink::GamePhase::Countdown ||
          room.phase == plink::GamePhase::Playing) &&
         OnlineMask(room) != 0x03U) {
+      if (room.battleEnabled) {
+        // Heartbeat expiry / missing endpoint is a passive network failure,
+        // unlike HandleGoodbye. Both v3 peers receive the same non-result.
+        EndSyncFailure(room);
+      } else {
       const uint8_t mask = OnlineMask(room);
       room.winnerSlot = mask == 0x01U ? 1 : (mask == 0x02U ? 2 : 0);
       room.endReason = plink::MatchEndReason::PlayerDisconnected;
       room.phase = plink::GamePhase::Finished;
       room.phaseStarted = now;
+      }
     }
     if (room.phase == plink::GamePhase::Countdown &&
         now - room.phaseStarted >= std::chrono::seconds(3)) {
@@ -1052,12 +1229,32 @@ class PetServer {
       room.phaseStarted = room.matchStarted = now;
     }
     if (room.phase == plink::GamePhase::Playing) {
-      plink::StepWorld(room.world,
+      if (room.battleEnabled) {
+        const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - room.matchStarted).count();
+        const uint32_t elapsedTick = static_cast<uint32_t>(std::max<int64_t>(0, elapsed) * pcbattle::kHz / 1000000);
+        room.battle.Advance(elapsedTick, static_cast<uint32_t>(config_.matchSeconds) * pcbattle::kHz);
+        if (room.battle.failed) { EndSyncFailure(room); return; }
+        room.battle.world.Export(room.world);
+      } else if (room.motionEnabled) {
+        pcmotion::Command commands[2]{};
+        for (unsigned i = 0; i < 2; ++i) {
+          auto &member = room.clients[i];
+          if (member.motionInputs.Pop(commands[i])) member.lastMotionProcessed = now;
+          const auto lastProgress = member.lastMotionProcessed == Clock::time_point{}
+              ? room.matchStarted : member.lastMotionProcessed;
+          if (now - lastProgress > std::chrono::seconds(2)) {
+            EndSyncFailure(room);
+            return;
+          }
+        }
+        room.motion.Step(room.world, commands);
+      } else if (serverTick_ % 2 == 0) plink::StepWorld(room.world,
                        room.clients[0].active ? room.clients[0].input : 0,
                        room.clients[1].active ? room.clients[1].input : 0,
                        false);
-      const bool timeUp = now - room.matchStarted >=
-                          std::chrono::seconds(config_.matchSeconds);
+      const bool timeUp = room.battleEnabled
+          ? room.battle.world.tick >= static_cast<uint32_t>(config_.matchSeconds) * pcbattle::kHz
+          : now - room.matchStarted >= std::chrono::seconds(config_.matchSeconds);
       const bool dead = room.world.players[0].health == 0 ||
                         room.world.players[1].health == 0;
       if (timeUp || dead) {
@@ -1077,7 +1274,7 @@ class PetServer {
         room.phaseStarted = now;
       }
     }
-    if ((serverTick_ % 2U) == 0U) SendSnapshots(room);
+    if ((serverTick_ % (room.motionEnabled ? 2U : 4U)) == 0U) SendSnapshots(room);
   }
 
   void Tick() {
@@ -1131,8 +1328,8 @@ class PetServer {
                                client.lastSequence, serverTick_);
     plink::WelcomePayload welcome;
     welcome.assignedSlot = client.slot;
-    welcome.tickRate = 30;
-    welcome.firePeriodTicks = plink::kFirePeriodTicks;
+    welcome.tickRate = client.supportsMotion ? 60 : 30;
+    welcome.firePeriodTicks = client.supportsMotion ? 48 : plink::kFirePeriodTicks;
     welcome.serverTimeMs = MillisSince(start_);
     if (plink::WriteWelcome(writer, welcome)) Send(client, bytes, writer.Finish());
   }
@@ -1197,7 +1394,7 @@ class PetServer {
     }
     for (Client &client : room.clients) {
       if (!client.active) continue;
-      {
+      if (!client.supportsDnd) {
         uint8_t metaBytes[plink::kMaxPacketSize]{};
         plink::PacketWriter metaWriter(
             metaBytes, sizeof(metaBytes), pcpair::kRoundMetaPacketType,
@@ -1221,6 +1418,73 @@ class PetServer {
       snapshot.phaseRemainingMs = remainingMs;
       snapshot.matchElapsedMs = matchElapsedMs;
       uint8_t bytes[plink::kMaxPacketSize]{};
+      if (client.supportsDnd) {
+        pcpair::PresenceSnapshot state;
+        state.acknowledgedRevision = client.dndRevision;
+        for (const auto &member : room.clients) {
+          if (!member.active || !(snapshot.onlineMask & (1U << (member.slot - 1)))) continue;
+          const auto bit = static_cast<uint8_t>(1U << (member.slot - 1));
+          if (member.supportsDnd) state.capableMask |= bit;
+          if (member.supportsDnd && member.dndRevision != 0) {
+            state.knownMask |= bit;
+            if (member.doNotDisturb) state.enabledMask |= bit;
+          }
+        }
+        state.interruptedByDnd = room.dndInterrupted;
+        state.interruptedInviter = room.dndInterruptedInviter;
+        state.blockedOperation = client.blockedOperation;
+        state.blockedReason = client.blockedReason;
+        state.roundId = room.roundId;
+        state.inviteId = room.inviteId;
+        state.game = snapshot;
+        if (client.supportsMotion && pcpair::GameProtocolFor(client.appVersion) == 3) {
+          pcbattle::State battle;
+          battle.presence = state; battle.world = room.battle.world; battle.failed = room.syncFailed;
+          plink::PacketWriter writer(bytes, sizeof(bytes), pcbattle::kStateType,
+              client.session, ++serverSequence_, client.lastSequence, serverTick_);
+          if (pcbattle::WriteState(writer, battle)) Send(client, bytes, writer.Finish());
+          if (room.battleEnabled && room.phase == plink::GamePhase::Playing) {
+            pcbattle::Batch relay; relay.round = room.roundId;
+            relay.first = room.battle.world.tick + 1;
+            const auto &peerInputs = room.battle.inputs[client.slot == 1 ? 1 : 0];
+            while (relay.count < pcmotion::kBatchLimit &&
+                peerInputs.Get(relay.first + relay.count, relay.commands[relay.count])) ++relay.count;
+            if (relay.count) {
+              plink::PacketWriter rw(bytes, sizeof(bytes), pcbattle::kRelayType,
+                  client.session, ++serverSequence_, client.lastSequence, serverTick_);
+              if (pcbattle::WriteBatch(rw, relay)) Send(client, bytes, rw.Finish());
+            }
+          }
+          if (room.battleEnabled && room.battle.world.impactCount && room.roundId) {
+            pcbattle::Events events; events.round = room.roundId;
+            events.count = static_cast<uint8_t>(room.battle.world.impactCount);
+            events.hits = room.battle.world.impacts;
+            plink::PacketWriter ew(bytes, sizeof(bytes), pcbattle::kImpactType,
+                client.session, ++serverSequence_, client.lastSequence, serverTick_);
+            if (pcbattle::WriteEvents(ew, events)) Send(client, bytes, ew.Finish());
+          }
+          continue;
+        }
+        if (client.supportsMotion) {
+          pcmotion::Snapshot motion;
+          motion.presence = state;
+          motion.presence.game.lastProcessedInput = client.motionInputs.acknowledged;
+          motion.tick = room.motion.tick;
+          motion.syncFailed = room.syncFailed;
+          for (unsigned i = 0; i < 2; ++i) {
+            motion.fractions[i * 2] = static_cast<uint8_t>(room.motion.players[i].x % pcmotion::kUnit);
+            motion.fractions[i * 2 + 1] = static_cast<uint8_t>(room.motion.players[i].y % pcmotion::kUnit);
+          }
+          plink::PacketWriter writer(bytes, sizeof(bytes), pcmotion::kSnapshotType,
+              client.session, ++serverSequence_, client.lastSequence, serverTick_);
+          if (pcmotion::WriteSnapshot(writer, motion)) Send(client, bytes, writer.Finish());
+          continue;
+        }
+        plink::PacketWriter writer(bytes, sizeof(bytes), pcpair::kPresenceSnapshotType,
+            client.session, ++serverSequence_, client.lastSequence, serverTick_);
+        if (pcpair::WritePresenceSnapshot(writer, state)) Send(client, bytes, writer.Finish());
+        continue;
+      }
       plink::PacketWriter writer(bytes, sizeof(bytes),
                                  plink::PacketType::Snapshot, client.session,
                                  ++serverSequence_, client.lastSequence,

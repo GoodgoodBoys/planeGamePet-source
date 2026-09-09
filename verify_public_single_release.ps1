@@ -5,13 +5,17 @@
 
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$releaseHeader = Get-Content -Raw -LiteralPath (Join-Path $root 'common\app_version.h')
+$releaseVersion = if ($releaseHeader -match 'kString\[\] = "(\d+\.\d+\.\d+)"') { $Matches[1] } else { throw 'Missing release version' }
+$FormalRelease = ($releaseHeader -match 'kReleaseEpoch = 1;') -and (-not $ExpectedVersion -or $ExpectedVersion -eq $releaseVersion)
+$packageFamily = if ($FormalRelease) { 'Release' } else { 'Public' }
 if ([string]::IsNullOrWhiteSpace($ExpectedVersion)) {
     $taskVersionHeader = Get-Content -Raw -LiteralPath (Join-Path $root 'common\app_version.h')
     if ($taskVersionHeader -notmatch 'kString\[\] = "(\d+\.\d+\.\d+)"') { throw 'Missing app version' }
     $ExpectedVersion = $Matches[1]
 }
 if ([string]::IsNullOrWhiteSpace($Archive)) {
-    $Archive = Join-Path $root "dist\PlanePet-Public-Single-$ExpectedVersion.zip"
+    $Archive = Join-Path $root "dist\PlanePet-$packageFamily-Single-$ExpectedVersion.zip"
 }
 $Archive = [IO.Path]::GetFullPath($Archive)
 if (-not (Test-Path -LiteralPath $Archive -PathType Leaf)) {
@@ -41,6 +45,24 @@ try {
     $entries = @($zip.Entries | Where-Object { -not $_.FullName.EndsWith('/') })
     $names = @($entries.FullName | Sort-Object)
     $expected = @("PlanePet.exe", "使用说明.txt") | Sort-Object
+    if ($FormalRelease -or [version]$ExpectedVersion -ge [version]'1.0.16') {
+        $expected += 'HELP.md'
+        $helpEntry = $entries | Where-Object FullName -eq 'HELP.md'
+        if (-not $helpEntry) { throw 'Missing help document' }
+        $helpReader = [IO.StreamReader]::new($helpEntry.Open(), [Text.Encoding]::UTF8)
+        try { $helpText = $helpReader.ReadToEnd() } finally { $helpReader.Dispose() }
+        if ($helpText -cne (Get-Content -Raw -LiteralPath (Join-Path $root 'HELP.md'))) {
+            throw 'Packaged help differs from the approved help document'
+        }
+    }
+    if ($FormalRelease -or [version]$ExpectedVersion -ge [version]'1.0.3') {
+        $expected += @('PRIVACY.md', 'THIRD-PARTY-NOTICES.md')
+        $expected += @($names | Where-Object { $_ -match '^licenses/(gcc|mingw-w64|winpthreads)/[A-Za-z0-9._-]+$' })
+        foreach ($requiredLicense in @('licenses/gcc/COPYING.RUNTIME','licenses/mingw-w64/COPYING','licenses/winpthreads/COPYING')) {
+            if ($requiredLicense -notin $names) { throw "Missing license: $requiredLicense" }
+        }
+        $expected = $expected | Sort-Object
+    }
     if (($names -join "|") -ne ($expected -join "|")) {
         throw "Unexpected archive contents: $($names -join ', ')"
     }
@@ -101,7 +123,7 @@ try {
     }
     $unicode = [Text.Encoding]::Unicode.GetString($bytes)
     foreach ($marker in @(
-            "runtime-public-", "PlanePetPublicLauncher",
+            $(if ($FormalRelease) { "runtime-release-" } else { "runtime-public-" }), "PlanePetPublicLauncher",
             "PlanePetTunnel.exe", "PlanePetClient.exe")) {
         if (-not $unicode.Contains($marker)) {
             throw "Missing embedded launcher marker: $marker"
@@ -119,16 +141,27 @@ try {
     }
     $instructions = Get-Content -Raw -LiteralPath $instructionsPath
     foreach ($required in @(
-            "单端公网最终测试版 v$ExpectedVersion", "两位测试者",
+            $(if ($FormalRelease) { "单端公网正式版 v$ExpectedVersion" } else { "单端公网最终测试版 v$ExpectedVersion" }), "两位测试者",
             "匿名测试统计", "六位匹配码", "TLS", "90 天", "在线状态",
             "显示/隐藏", "显示绑定电脑框", "勿扰状态", "发送/接收", "绑定存储",
-            "联网鉴权", "来源网络信息", "原始安装凭据不会上传", "退出")) {
+            "联网鉴权", "来源网络信息", "不可逆哈希", "退出")) {
         if (-not $instructions.Contains($required)) {
             throw "Instructions are missing required text: $required"
         }
     }
+    if ($FormalRelease -or [version]$ExpectedVersion -ge [version]'3.0.8') {
+        foreach ($required in @('通过 TLS 加密连接传输用于鉴权', '而非原始令牌', '关于…', '开发者 Ding', '离线阅读隐私说明和完整第三方许可')) {
+            if (-not $instructions.Contains($required)) { throw "Missing About/privacy release text: $required" }
+        }
+        if ($instructions.Contains('原始安装凭据不会上传')) { throw 'Obsolete credential transmission claim' }
+    }
     if (-not $instructions.Contains("检查软件更新")) {
         throw "Instructions are missing the update workflow."
+    }
+    if ($FormalRelease -or [version]$ExpectedVersion -ge [version]'1.0.3') {
+        foreach ($label in @('设置与隐私', '帮助与更新', '匿名使用统计')) {
+            if (-not $instructions.Contains($label)) { throw "Missing grouped menu documentation: $label" }
+        }
     }
     $builtExe = Join-Path $root "dist\PlanePetPublic.exe"
     if (-not (Test-Path -LiteralPath $builtExe) -or
@@ -141,7 +174,7 @@ try {
     Write-Output "PUBLIC_SINGLE_STATIC_OK"
     Write-Output "archive=$Archive"
     Write-Output "sha256=$archiveHash"
-    Write-Output "pe=x64-gui icon=game-aircraft embedded=client+tunnel+updater entries=2"
+    Write-Output "pe=x64-gui icon=game-aircraft embedded=client+tunnel+updater entries=$($names.Count)"
     Write-Output "signature=$($signature.Status)"
 }
 finally {

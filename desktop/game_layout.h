@@ -14,6 +14,32 @@ constexpr int kGameHudHeight = 52;
 constexpr int kGamePlayHeight = plink::kWorldHeight;
 constexpr int kGameClientWidth = plink::kWorldWidth;
 constexpr int kGameClientHeight = kGameHudHeight + kGamePlayHeight;
+// Same A heart atlas as history, sized for the unchanged 240px compact HUD.
+constexpr int kGameHeartWidth = 13;
+constexpr int kGameHeartHeight = 12;
+constexpr int kGameHeartPitch = 14;
+constexpr int kGameOwnHeartX = 28;
+constexpr int kGamePeerHeartX = kGameClientWidth - 1 - (kGameOwnHeartX + 2 * kGameHeartPitch);
+constexpr int kGameHeartY = 19;
+// Odd-sized hearts mirror their pixel centers; even-sized plane sprite boxes
+// mirror their edges. This also remains exact when the whole HUD is scaled.
+constexpr int kGameOwnPlaneX = 12;
+constexpr int kGamePeerPlaneX = kGameClientWidth - kGameOwnPlaneX;
+constexpr int kGamePlaneY = 22;
+constexpr int kGameOwnHitX = 82;
+constexpr int kGamePeerHitX = kGameClientWidth - kGameOwnHitX;
+constexpr int kGameHitY = 19;
+constexpr int kGameTimerLeft = 100, kGameTimerRight = 140;
+static_assert(kGameOwnHeartX + kGamePeerHeartX + 2 * kGameHeartPitch == kGameClientWidth - 1);
+static_assert(kGameOwnPlaneX + kGamePeerPlaneX == kGameClientWidth);
+static_assert(kGameOwnHitX + kGamePeerHitX == kGameClientWidth);
+static_assert(kGameOwnHitX + 18 <= kGameTimerLeft && kGamePeerHitX - 18 >= kGameTimerRight);
+static_assert(kGameOwnHeartX + 2 * kGameHeartPitch + kGameHeartWidth / 2 + 1 < kGameOwnHitX - 18);
+static_assert(kGameHeartWidth < kGameHeartPitch);
+static_assert(kGameOwnHeartX + 2 * kGameHeartPitch + kGameHeartWidth / 2 < 76);
+static_assert(kGamePeerHeartX - kGameHeartWidth / 2 > 164);
+static_assert(kGameHeartY + kGameHeartHeight / 2 < kGameHudHeight);
+static_assert(kGameHeartY + kGameHeartHeight / 2 + 10 < kGameHudHeight);
 
 struct GameLayout {
   int scale = 1;

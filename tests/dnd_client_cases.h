@@ -1,0 +1,104 @@
+int RunDndClientCases(PetClient &client, SOCKET sender, const sockaddr_in &endpoint) {
+  using plink::GamePhase;
+  client.session_ = 100; client.slot_ = 1; client.bindingId_ = 222;
+  client.awaitingPairing_ = client.pairingAttempted_ = client.pairingCancelPending_ = false;
+  client.telemetryEnabled_ = false; client.pendingAction_ = 0;
+  client.hiddenByUser_ = client.gameMode_ = false;
+  client.majorVersionMismatch_ = false;
+  client.scopedActionsSupported_ = true;
+  client.connectionNotice_.clear();
+  unsigned sequence = 100;
+  pcpair::PresenceSnapshot state;
+  state.game.onlineMask = 3; state.game.phase = GamePhase::Menu;
+  state.capableMask = state.knownMask = 3; state.enabledMask = 2;
+  state.acknowledgedRevision = 1;
+  const auto deliver = [&]() {
+    uint8_t bytes[plink::kMaxPacketSize]{};
+    ++sequence;
+    plink::PacketWriter writer(bytes, sizeof(bytes), pcpair::kPresenceSnapshotType,
+        100, sequence, 0, sequence);
+    pcpair::WritePresenceSnapshot(writer, state);
+    const auto size = writer.Finish();
+    sendto(sender, reinterpret_cast<const char *>(bytes), static_cast<int>(size), 0,
+        reinterpret_cast<const sockaddr *>(&endpoint), sizeof(endpoint));
+    Sleep(10); client.ReceiveAll();
+  };
+  deliver();
+  if (!client.PeerDndKnown() || !client.peerDnd_ || !client.CanInvite()) return 60;
+  const auto normalBadges = client.StatusBadges();
+  if (normalBadges[0].visible || !normalBadges[1].visible || !normalBadges[1].moon) return 61;
+  client.InviteFromMenu();
+  if (!client.HasDndNotice() || client.pendingAction_ || !client.CanSendQuickEmote()) return 62;
+  const auto deadline = client.dndNoticeUntil_;
+  client.InviteFromMenu();
+  if (client.dndNoticeUntil_ != deadline) return 63;
+  const auto emote = client.QuickEmoteRect(0);
+  client.toolbar_.Reset();
+  client.toolbar_.Observe(true, true, false, GetTickCount64());
+  client.toolbar_.Toggle(GetTickCount64() - plane_pet_ui::kToolbarSlideMs);
+  client.OnLeftButtonDown(emote.left + 8, emote.top + 8);
+  client.OnLeftButtonUp(emote.left + 8, emote.top + 8);
+  if (client.ownEmote_ != 1 || !client.HasDndNotice()) return 64;
+  client.OnLeftButtonDown(220, 82);
+  if (client.HasDndNotice() || client.pendingAction_) return 65;
+  client.InviteFromMenu(); client.OnKeyDown(VK_ESCAPE);
+  if (client.HasDndNotice() || client.pendingAction_) return 66;
+  client.InviteFromMenu(); client.dndNoticeUntil_ = Clock::now() - std::chrono::milliseconds(1);
+  if (client.HasDndNotice()) return 67;
+  // A real incoming invite supersedes the card; no stale cancel targets it.
+  client.InviteFromMenu();
+  state.enabledMask = 0; state.game.phase = GamePhase::Waiting; state.game.inviterSlot = 2;
+  state.inviteId = 500; deliver();
+  if (client.HasDndNotice() || !client.IsIncomingInvite()) return 68;
+  client.OnLeftButtonDown(220, 82);
+  if (client.pendingAction_) return 69;
+  client.OnLeftButtonUp();
+  state.game.phase = GamePhase::Menu; state.game.inviterSlot = 0; deliver();
+  // Preference changed between last presence and Invite: authoritative result.
+  client.InviteFromMenu();
+  const auto operation = client.dndAttemptOperation_;
+  if (!operation || client.pendingAction_ != 1) return 70;
+  state.blockedOperation = operation; state.blockedReason = pcpair::InviteBlock::DoNotDisturb;
+  state.enabledMask = 2; deliver();
+  if (!client.HasDndNotice() || client.pendingAction_) return 71;
+  const auto once = client.dndNoticeUntil_; deliver();
+  if (client.dndNoticeUntil_ != once) return 72;
+  client.ClearDndNotice();
+  // Explicit outcome still shown exactly once if every Waiting snapshot was lost.
+  state.interruptedByDnd = true; state.interruptedInviter = 1; state.inviteId = 700;
+  state.game.endReason = plink::MatchEndReason::InviteRejected; deliver();
+  if (!client.HasDndNotice() || !client.inviteFeedback_.empty()) return 73;
+  client.ClearDndNotice(); deliver();
+  if (client.HasDndNotice()) return 74;
+  client.doNotDisturb_ = true;
+  state.game.onlineMask = 1; state.enabledMask = 1; state.interruptedByDnd = false;
+  deliver();
+  const auto offline = client.StatusBadges();
+  if (!offline[0].moon || !offline[0].offline || offline[1].visible) return 75;
+  client.hiddenByUser_ = true; client.ShowDndNotice(L"hidden", true);
+  if (client.HasDndNotice() || !client.dndNotice_.empty()) return 76;
+  client.dndUsageOpen_ = false; client.telemetrySegmentOpen_ = true;
+  client.BeginDndUsage();
+  if (client.dndUsageOpen_) return 77;
+  client.telemetryEnabled_ = true; client.telemetryUploadChoice_ = 0;
+  client.eventsPath_.clear(); client.BeginDndUsage();
+  if (!client.dndUsageOpen_) return 78;
+  client.dndUsageSince_ -= std::chrono::seconds(2); client.EndDndUsage();
+  if (client.dndUsageOpen_ || client.dndUsageMillis_ < 2000) return 79;
+  client.telemetryEnabled_ = false;
+  if (!client.SaveSettings()) return 80;
+  client.doNotDisturb_ = false; client.LoadSettings();
+  if (!client.doNotDisturb_) return 81;
+  client.ResetDndConnection();
+  if (!client.doNotDisturb_ || client.peerDnd_ || client.dndSupported_ || client.dndAcknowledged_) return 82;
+  client.hiddenByUser_ = false; state.game.onlineMask = 3;
+  state.interruptedByDnd = true; state.inviteId = 700; deliver();
+  if (client.HasDndNotice()) return 83;
+  client.awaitingPairing_ = true; client.pairingPanelVisible_ = false;
+  client.ShowDndNotice(L"已开启勿扰", false);
+  if (!client.HasDndNotice()) return 84;
+  client.pairingPanelVisible_ = true;
+  if (client.HasDndNotice()) return 85; // inline hint in the binding card instead
+  std::puts("DND_CLIENT_UDP_STATUS_NOTICE_RACES_EMOTES_PRIVACY_PERSISTENCE_OK");
+  return 0;
+}

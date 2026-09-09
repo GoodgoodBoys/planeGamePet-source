@@ -37,9 +37,15 @@
 #undef WinMain
 #undef private
 
+#include "dnd_client_cases.h"
+#include "motion_client_cases.h"
+#include "battle_client_cases.h"
+#include "release_migration_cases.h"
+
 int main(int argc, char **argv) {
   if (argc != 2) return 2;
   const auto directory = std::filesystem::u8path(argv[1]);
+  if (const int migration = RunReleaseMigrationCases(directory)) return migration;
   WSADATA winsock{};
   if (WSAStartup(MAKEWORD(2, 2), &winsock) != 0) return 3;
   PetClient client;
@@ -55,6 +61,39 @@ int main(int argc, char **argv) {
   client.session_ = 100;
   client.gameMode_ = false;
   client.pendingAction_ = 0;
+
+  // The card geometry is shared with drawing: newly added button edges must
+  // remain clickable while padding/gaps never submit a game action.
+  const auto actionAt = [&](int x, int y) {
+    client.pendingAction_ = 0;
+    client.OnLeftButtonDown(x, y);
+    client.OnLeftButtonUp();
+    return client.pendingAction_;
+  };
+  using namespace plane_pet_ui;
+  constexpr auto acceptAction = static_cast<uint8_t>(plink::PlayerAction::Accept);
+  constexpr auto returnAction = static_cast<uint8_t>(plink::PlayerAction::ReturnToMenu);
+  if (!HasInset(kIncomingInviteLayout.panel, kIncomingInviteLayout.primary, 10) ||
+      !HasInset(kIncomingInviteLayout.panel, kIncomingInviteLayout.secondary, 10) ||
+      !HasInset(kOutgoingInviteLayout.panel, kOutgoingInviteLayout.primary, 10)) return 30;
+  if (client.IsQuickEmoteBarVisible() || actionAt(53, 103) != acceptAction ||
+      actionAt(133, 129) != acceptAction || actionAt(147, 103) != returnAction ||
+      actionAt(227, 129) != returnAction) return 31;
+  if (actionAt(140, 116) != 0 || actionAt(80, 135) != 0 ||
+      actionAt(47, 110) != 0) return 32;
+  client.snapshot_.inviterSlot = 2;
+  if (actionAt(205, 87) != returnAction || actionAt(251, 121) != returnAction ||
+      actionAt(257, 110) != 0 || actionAt(220, 126) != 0 ||
+      actionAt(175, 104) != 0) return 33;
+  if (!client.IsInteractivePetPoint(22, 104) || client.IsInteractivePetPoint(194, 145)) return 34;
+  client.snapshot_.phase = plink::GamePhase::Menu;
+  client.toolbar_.Observe(true, true, false, GetTickCount64());
+  client.toolbar_.Toggle(GetTickCount64() - plane_pet_ui::kToolbarSlideMs);
+  if (!client.IsQuickEmoteBarVisible()) return 35;
+  client.snapshot_.phase = plink::GamePhase::Waiting;
+  client.snapshot_.inviterSlot = 1;
+  client.pendingAction_ = 0;
+  std::puts("INVITE_PADDING_HIT_REGIONS_AND_EMOTE_VISIBILITY_OK");
 
   // Lower part of Accept lies inside a (hidden) quick-emote rectangle.
   client.OnLeftButtonDown(90, 118);
@@ -158,9 +197,12 @@ int main(int argc, char **argv) {
   if (client.pairingCancelPending_ ||
       std::filesystem::exists(client.statePath_.wstring() + L".pairing")) return 19;
   std::puts("PAIR_CANCELLATION_JOURNAL_ACK_OK");
+  const auto dndResult = RunDndClientCases(client, sender, endpoint);
+  const auto motionResult = dndResult ? dndResult : RunMotionClientCases(client, directory);
+  const auto battleResult = motionResult ? motionResult : RunBattleClientCases(client, directory);
   closesocket(sender);
   closesocket(client.socket_);
   client.socket_ = INVALID_SOCKET;
   WSACleanup();
-  return 0;
+  return battleResult;
 }

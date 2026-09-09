@@ -47,7 +47,10 @@ def load_admin_password():
 
 
 ADMIN_PASSWORD = load_admin_password()
-MAX_CONNECTIONS = int(os.environ.get("PLANE_PET_MAX_CONNECTIONS", "128"))
+# 0 disables only the aggregate admission ceiling, not abuse controls or resource limits.
+MAX_CONNECTIONS = int(os.environ.get("PLANE_PET_MAX_CONNECTIONS", "0"))
+if MAX_CONNECTIONS < 0:
+    raise ValueError("PLANE_PET_MAX_CONNECTIONS must be zero or positive")
 MAX_ENROLLMENTS = int(os.environ.get("PLANE_PET_MAX_ENROLLMENTS", "1000"))
 MAX_ENROLLMENTS_PER_IP = int(os.environ.get(
     "PLANE_PET_MAX_ENROLLMENTS_PER_IP", "64"))
@@ -92,6 +95,8 @@ ALLOWED_EVENTS = frozenset({
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 active_connections = 0
+established_connections = 0
+online_alert_recorder = None
 active_installations = {}
 active_lock = asyncio.Lock()
 telemetry_db = None
@@ -503,7 +508,7 @@ def render_admin_page() -> bytes:
         ("剩余测试名额", data["capacity_remaining"]),
         ("统计写入失败（本次运行）", data["telemetry_write_failures"]),
         ("当前连接", active_connections),
-        ("连接上限", MAX_CONNECTIONS),
+        ("总连接上限", MAX_CONNECTIONS if MAX_CONNECTIONS else "未设置（保留防滥用限制）"),
         ("统计队列丢弃（本次运行）", telemetry_service.dropped if telemetry_service else 0),
         ("匹配成功", data["pairing_matched"]), ("发出邀请", data["invites"]),
         ("邀请接受率", f'{data["invite_acceptance"]}%'),
@@ -722,6 +727,10 @@ async def probe_backend():
 def runtime_status():
     return {
         "connections": active_connections, "connection_limit": MAX_CONNECTIONS,
+        "established_connections": established_connections,
+        "online_alerts_recording": online_alert_recorder is not None,
+        "online_alerts_pending_persistence": len(online_alert_recorder.pending) if online_alert_recorder else 0,
+        "online_alerts_persistence_error": online_alert_recorder.last_error if online_alert_recorder else "",
         "enrollments": len(TOKENS), "enrollment_limit": MAX_ENROLLMENTS,
         "enrollment_remaining": max(0, MAX_ENROLLMENTS - len(TOKENS)),
         "capacity_warning": len(TOKENS) >= MAX_ENROLLMENTS * .8,
@@ -732,11 +741,12 @@ def runtime_status():
 
 
 async def handle_client(reader, writer) -> None:
-    global active_connections
+    global active_connections, established_connections
     peer = writer.get_extra_info("peername")
     client_ip = peer[0] if peer else "unknown"
     digest = None
     counted = False
+    established = False
     try:
         method, path, headers = await read_request(reader)
         # Only the loopback proxy is trusted. The rightmost value is safe with
@@ -800,7 +810,7 @@ async def handle_client(reader, writer) -> None:
             await send_http(writer, "400 Bad Request", b"valid WebSocket upgrade required\n")
             return
         async with active_lock:
-            if (active_connections >= MAX_CONNECTIONS or
+            if ((MAX_CONNECTIONS > 0 and active_connections >= MAX_CONNECTIONS) or
                     active_installations.get(digest, 0) >= MAX_CONNECTIONS_PER_INSTALL):
                 await send_http(writer, "503 Service Unavailable", b"connection limit\n",
                                 extra_headers=("X-Plane-Pet-Error: connection_limit", "Retry-After: 30"))
@@ -843,6 +853,13 @@ async def handle_client(reader, writer) -> None:
                      b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
                      b"Sec-WebSocket-Accept: " + accept + b"\r\n\r\n")
         await writer.drain()
+        established_connections += 1
+        established = True
+        if online_alert_recorder is not None:
+            try:
+                online_alert_recorder.observe(established_connections, MAX_CONNECTIONS)
+            except Exception:
+                logging.exception("online milestone observation failed; tunnel remains available")
         logging.info("tunnel opened install=%s active=%d", digest[:8], active_connections)
         await bridge(reader, writer, digest)
     except (asyncio.IncompleteReadError, asyncio.LimitOverrunError,
@@ -852,6 +869,8 @@ async def handle_client(reader, writer) -> None:
         logging.exception("unexpected gateway error install=%s",
                           digest[:8] if digest else "unknown")
     finally:
+        if established:
+            established_connections -= 1
         if counted:
             async with active_lock:
                 active_connections -= 1
@@ -937,7 +956,12 @@ class TelemetryService:
 
 
 async def main() -> None:
-    global telemetry_service
+    global telemetry_service, online_alert_recorder
+    if os.environ.get("PLANE_PET_ONLINE_ALERTS_ENABLED", "0") == "1":
+        from online_alerts import Recorder
+        online_alert_recorder = Recorder(os.environ.get(
+            "PLANE_PET_ONLINE_ALERT_STORE", "/var/lib/plane-pet/online-alerts.db"))
+        online_alert_recorder.start()
     service = TelemetryService()
     try:
         await service.start()
@@ -953,6 +977,8 @@ async def main() -> None:
         async with server:
             await server.serve_forever()
     finally:
+        if online_alert_recorder is not None:
+            await online_alert_recorder.stop()
         if telemetry_service is not None:
             await telemetry_service.stop()
 

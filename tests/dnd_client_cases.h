@@ -35,7 +35,6 @@ int RunDndClientCases(PetClient &client, SOCKET sender, const sockaddr_in &endpo
   const auto emote = client.QuickEmoteRect(0);
   client.toolbar_.Reset();
   client.toolbar_.Observe(true, true, false, GetTickCount64());
-  client.toolbar_.Toggle(GetTickCount64() - plane_pet_ui::kToolbarSlideMs);
   client.OnLeftButtonDown(emote.left + 8, emote.top + 8);
   client.OnLeftButtonUp(emote.left + 8, emote.top + 8);
   if (client.ownEmote_ != 1 || !client.HasDndNotice()) return 64;

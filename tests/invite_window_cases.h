@@ -67,8 +67,8 @@ void RunInviteWindowCases(HWND window, const std::filesystem::path &directory, C
     named("invite_cards_keep_pet_size_and_position", stable && sameRect(before, after));
     gClient.SeedDpiRenderCase(false);
     named("invite_idle_toolbar_waits_for_hover", !gClient.IsPetToolbarVisible());
-    gClient.SetToolbarTestState(true, true);
+    gClient.SetToolbarTestState(true);
     named("invite_idle_restores_emote_bar", gClient.IsQuickEmoteBarVisible() &&
-        gClient.IsInteractivePetPoint(194, 145));
+        gClient.IsInteractivePetPoint(194, 140));
   }
 }

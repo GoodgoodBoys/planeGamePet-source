@@ -16,7 +16,9 @@ Environment=PLANE_PET_TOKEN_STORE=/var/lib/plane-pet/gateway_tokens.db
 Environment=PLANE_PET_TELEMETRY_STORE=/var/lib/plane-pet/telemetry.db
 Environment=PLANE_PET_TELEMETRY_RETENTION_DAYS=90
 Environment=PLANE_PET_ADMIN_PASSWORD_FILE=/etc/plane-pet/gateway-admin.password
-Environment=PLANE_PET_MAX_CONNECTIONS=128
+# Disable aggregate admission ceiling; keep per-install/IP abuse protections.
+Environment=PLANE_PET_MAX_CONNECTIONS=0
+Environment=PLANE_PET_ONLINE_ALERTS_ENABLED=1
 Environment=PLANE_PET_MAX_ENROLLMENTS=1000
 # Rolling one-hour registration budget; not a lifetime device count.
 Environment=PLANE_PET_MAX_ENROLLMENTS_PER_IP=64

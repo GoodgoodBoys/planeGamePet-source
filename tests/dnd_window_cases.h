@@ -31,7 +31,7 @@ void RunDndWindowCases(HWND window, const std::filesystem::path &directory, Chec
       }
     }
     gClient.SeedDndRenderCase(false, true, true, false, true);
-    gClient.SetToolbarTestState(true, true);
+    gClient.SetToolbarTestState(true);
     RECT before{}, rect{}; GetWindowRect(window, &before); GetClientRect(window, &rect);
     const auto label = "dnd_notice_" + std::to_string(dpi);
     check((label + "_image").c_str(), SaveReleaseFixture(directory / (Wide(label) + L".png"),

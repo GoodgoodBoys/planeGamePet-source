@@ -130,7 +130,7 @@ bool RunReleaseWindowCases(HWND window) {
         actual.bottom == kPetHeight);
     POINT click{194, 130};
     const POINT logical = gClient.LogicalClientPoint(click);
-    gClient.SetToolbarTestState(true, true);
+    gClient.SetToolbarTestState(true);
     named("dpi_pet_emote_hit", std::abs(logical.x - 194) <= 1 && std::abs(logical.y - 130) <= 1 &&
         gClient.IsInteractivePetPoint(logical.x, logical.y));
     named("dpi_pet_image", SaveReleaseFixture(state.parent_path() / (L"pet-" + std::to_wstring(dpi) + L".png"),

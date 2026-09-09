@@ -175,6 +175,7 @@ struct ParsedUrl {
   std::wstring host;
   std::wstring path;
   INTERNET_PORT port = 0;
+  bool secure = true;
 };
 
 bool ParseAllowedUrl(const std::string &url, ParsedUrl &parsed) {
@@ -187,12 +188,21 @@ bool ParseAllowedUrl(const std::string &url, ParsedUrl &parsed) {
   components.dwExtraInfoLength = static_cast<DWORD>(-1);
   if (!WinHttpCrackUrl(wide.c_str(), static_cast<DWORD>(wide.size()), 0,
                        &components) ||
-      components.nScheme != INTERNET_SCHEME_HTTPS ||
-      components.nPort != INTERNET_DEFAULT_HTTPS_PORT) {
+      components.dwHostNameLength == 0) {
     return false;
   }
   parsed.host.assign(components.lpszHostName, components.dwHostNameLength);
+#ifdef PLANE_PET_UPDATE_NETWORK_TEST
+  const bool testLoopback = parsed.host == L"127.0.0.1" && components.nPort != 0 &&
+      (components.nScheme == INTERNET_SCHEME_HTTP || components.nScheme == INTERNET_SCHEME_HTTPS);
+  if (!testLoopback) {
+#endif
+  if (components.nScheme != INTERNET_SCHEME_HTTPS || components.nPort != INTERNET_DEFAULT_HTTPS_PORT) return false;
   if (_wcsicmp(parsed.host.c_str(), kAllowedHost) != 0) return false;
+#ifdef PLANE_PET_UPDATE_NETWORK_TEST
+  }
+#endif
+  parsed.secure = components.nScheme == INTERNET_SCHEME_HTTPS;
   parsed.path.assign(components.lpszUrlPath, components.dwUrlPathLength);
   if (components.dwExtraInfoLength != 0)
     parsed.path.append(components.lpszExtraInfo,
@@ -201,78 +211,128 @@ bool ParseAllowedUrl(const std::string &url, ParsedUrl &parsed) {
   return !parsed.path.empty();
 }
 
+// One reference belongs to HttpGet, another to WinHTTP until HANDLE_CLOSING.
+// Pending ReadData must not reference a worker stack buffer after cancellation.
+#ifdef PLANE_PET_UPDATE_NETWORK_TEST
+std::atomic<unsigned> testLiveHttpContexts{0};
+std::atomic<DWORD> testLastHttpError{0};
+#endif
+struct HttpContext {
+#ifdef PLANE_PET_UPDATE_NETWORK_TEST
+  HttpContext() { ++testLiveHttpContexts; }
+  ~HttpContext() { --testLiveHttpContexts; }
+#endif
+  std::atomic<unsigned> references{1};
+  HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+  std::atomic<DWORD> completion{0}, received{0};
+  std::array<uint8_t, 16384> buffer{};
+  void Release() { if (references.fetch_sub(1) == 1) { if (event) CloseHandle(event); delete this; } }
+};
+void CALLBACK HttpCallback(HINTERNET, DWORD_PTR value, DWORD status, void *info, DWORD size) {
+#ifdef PLANE_PET_UPDATE_NETWORK_TEST
+  if (status == WINHTTP_CALLBACK_STATUS_REQUEST_ERROR && info)
+    testLastHttpError.store(static_cast<WINHTTP_ASYNC_RESULT *>(info)->dwError);
+#else
+  (void)info;
+#endif
+  auto *context = reinterpret_cast<HttpContext *>(value);
+  if (!context) return;
+  if (status == WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) { context->Release(); return; }
+  if (status == WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE ||
+      status == WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE ||
+      status == WINHTTP_CALLBACK_STATUS_READ_COMPLETE ||
+      status == WINHTTP_CALLBACK_STATUS_REQUEST_ERROR) {
+    context->received.store(size);
+    context->completion.store(status);
+    SetEvent(context->event);
+  }
+}
 bool HttpGet(const std::string &url, size_t maximum,
              std::vector<uint8_t> &result,
              const std::atomic<bool> *cancel = nullptr,
              std::atomic<unsigned> *progress = nullptr) {
-  if (cancel != nullptr && cancel->load()) return false;
+  if (cancel && cancel->load()) return false;
   ParsedUrl parsed;
   if (!ParseAllowedUrl(url, parsed)) return false;
+  DWORD access = WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY;
+#ifdef PLANE_PET_UPDATE_NETWORK_TEST
+  if (parsed.host == L"127.0.0.1") access = WINHTTP_ACCESS_TYPE_NO_PROXY;
+#endif
   HINTERNET session = WinHttpOpen(
-      L"PlanePetUpdater/1.0", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-  if (session == nullptr) return false;
+      L"PlanePetUpdater/1.0", access,
+      WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
+  if (!session) return false;
   WinHttpSetTimeouts(session, 5000, 5000, 10000, 15000);
-  HINTERNET connection = WinHttpConnect(session, parsed.host.c_str(),
-                                        parsed.port, 0);
-  HINTERNET request = connection == nullptr
-      ? nullptr
-      : WinHttpOpenRequest(connection, L"GET", parsed.path.c_str(), nullptr,
-                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
-                           WINHTTP_FLAG_SECURE);
+  HINTERNET connection = WinHttpConnect(session, parsed.host.c_str(), parsed.port, 0);
+  HINTERNET request = connection ? WinHttpOpenRequest(connection, L"GET", parsed.path.c_str(), nullptr,
+      WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, parsed.secure ? WINHTTP_FLAG_SECURE : 0) : nullptr;
+  auto *context = new HttpContext;
+  DWORD_PTR contextValue = reinterpret_cast<DWORD_PTR>(context);
   DWORD redirectPolicy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
-  if (request != nullptr)
-    WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy,
-                     sizeof(redirectPolicy));
-  bool ok = request != nullptr &&
-      WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                         WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-      WinHttpReceiveResponse(request, nullptr);
-  DWORD status = 0;
-  DWORD statusSize = sizeof(status);
-  if (ok)
-    ok = WinHttpQueryHeaders(request,
-                             WINHTTP_QUERY_STATUS_CODE |
-                                 WINHTTP_QUERY_FLAG_NUMBER,
-                             WINHTTP_HEADER_NAME_BY_INDEX, &status,
-                             &statusSize, WINHTTP_NO_HEADER_INDEX) &&
-         status == 200;
+  bool ok = request && context->event &&
+      WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &redirectPolicy, sizeof(redirectPolicy)) &&
+      WinHttpSetOption(request, WINHTTP_OPTION_CONTEXT_VALUE, &contextValue, sizeof(contextValue));
+  if (ok) {
+    ++context->references;
+    ok = WinHttpSetStatusCallback(request, HttpCallback,
+        WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS | WINHTTP_CALLBACK_FLAG_HANDLES, 0) != WINHTTP_INVALID_STATUS_CALLBACK;
+    if (!ok) context->Release();
+  }
+  auto begin = [&] { ResetEvent(context->event); context->completion.store(0); context->received.store(0); };
+  auto wait = [&](BOOL initiated, DWORD expected) {
+#ifdef PLANE_PET_UPDATE_NETWORK_TEST
+    if (!initiated) testLastHttpError.store(GetLastError());
+#endif
+    if (!initiated) return false;
+    const ULONGLONG deadline = GetTickCount64() + 20000;
+    for (;;) {
+      if ((cancel && cancel->load()) || GetTickCount64() >= deadline) return false;
+      const DWORD signaled = WaitForSingleObject(context->event, 25);
+      if (signaled == WAIT_OBJECT_0) return context->completion.load() == expected;
+      if (signaled != WAIT_TIMEOUT) return false;
+    }
+  };
+  if (ok) {
+    begin();
+    ok = wait(WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0, 0, contextValue), WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE);
+  }
+  if (ok) {
+    begin();
+    ok = wait(WinHttpReceiveResponse(request, nullptr), WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE);
+  }
+  DWORD status = 0, statusSize = sizeof(status);
+  if (ok) ok = WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+      WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize, WINHTTP_NO_HEADER_INDEX) && status == 200;
   uint64_t contentLength = 0;
   wchar_t contentLengthText[32]{};
   DWORD contentLengthSize = sizeof(contentLengthText);
-  if (ok && WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH,
-                                WINHTTP_HEADER_NAME_BY_INDEX,
-                                contentLengthText, &contentLengthSize,
-                                WINHTTP_NO_HEADER_INDEX)) {
+  if (ok && WinHttpQueryHeaders(request, WINHTTP_QUERY_CONTENT_LENGTH, WINHTTP_HEADER_NAME_BY_INDEX,
+      contentLengthText, &contentLengthSize, WINHTTP_NO_HEADER_INDEX)) {
     contentLength = _wcstoui64(contentLengthText, nullptr, 10);
     if (contentLength > maximum) ok = false;
   }
   result.clear();
-  std::array<uint8_t, 16384> buffer{};
   while (ok) {
-    if (cancel != nullptr && cancel->load()) {
-      ok = false;
-      break;
-    }
-    DWORD received = 0;
-    if (!WinHttpReadData(request, buffer.data(), buffer.size(), &received)) {
-      ok = false;
-      break;
-    }
-    if (received == 0) break;
-    if (received > maximum || result.size() > maximum - received) {
-      ok = false;
-      break;
-    }
-    result.insert(result.end(), buffer.begin(), buffer.begin() + received);
-    if (progress != nullptr && contentLength != 0)
-      progress->store(static_cast<unsigned>(
-          std::min<uint64_t>(99, result.size() * 100ULL / contentLength)));
+    if (cancel && cancel->load()) { ok = false; break; }
+    begin();
+    ok = wait(WinHttpReadData(request, context->buffer.data(),
+        static_cast<DWORD>(context->buffer.size()), nullptr), WINHTTP_CALLBACK_STATUS_READ_COMPLETE);
+    if (!ok) break;
+    const DWORD received = context->received.load();
+    if (!received) { ok = contentLength == 0 || result.size() == contentLength; break; }
+    if (received > maximum || result.size() > maximum - received) { ok = false; break; }
+    result.insert(result.end(), context->buffer.begin(), context->buffer.begin() + received);
+    if (progress && contentLength) progress->store(static_cast<unsigned>(
+        std::min<uint64_t>(99, result.size() * 100ULL / contentLength)));
   }
-  if (request != nullptr) WinHttpCloseHandle(request);
-  if (connection != nullptr) WinHttpCloseHandle(connection);
+  // Only this worker closes its async handle, after each API call has returned.
+  // A late completion cannot touch result, cancel, progress or Manager.
+  if (request) WinHttpCloseHandle(request);
+  if (connection) WinHttpCloseHandle(connection);
   WinHttpCloseHandle(session);
-  return ok;
+  context->Release();
+  return ok && !(cancel && cancel->load());
 }
 
 bool JsonString(const std::string &json, const char *key, std::string &value) {

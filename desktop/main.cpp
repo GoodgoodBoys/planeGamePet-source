@@ -45,8 +45,11 @@
 #include "pet_layout.h"
 #include "pet_toolbar.h"
 #include "pet_idle.h"
+#include "pet_flight.h"
 #include "pet_text.h"
 #include "history_layout.h"
+#include "history_store.h"
+#include "event_log.h"
 #include "heart_assets.h"
 #include "help_content.h"
 #include "about_window.h"
@@ -162,25 +165,10 @@ class GdiPlusSession {
 
 GdiPlusSession gGdiPlusSession;
 
-struct PetAnimationPose {
-  double x = 0.0;
-  double y = 0.0;
-  double angle = 0.0;
-  double directionX = 0.0;
-  double directionY = -1.0;
-};
+using plane_pet_ui::PetAnimationPose;
+using plane_pet_ui::PetFormation;
 
-struct PetFormation {
-  PetAnimationPose blue{};
-  PetAnimationPose red{};
-};
-
-struct HistoryEntry {
-  uint64_t timestampMs = 0;
-  uint8_t ownHealth = 0;
-  uint8_t peerHealth = 0;
-  int8_t outcome = 0;
-};
+using HistoryEntry = plane_pet_history::Entry;
 
 std::string Option(const char *name, const char *fallback) {
   const std::string key(name);
@@ -353,6 +341,10 @@ class PetClient {
     historyPath_ = statePath_.parent_path() /
                    (statePath_.stem().wstring() + L".history");
     LoadHistory();
+    if (!historyPersistenceOk_ || historyRecovered_) {
+      connectionNotice_ = historyRecovered_ ? L"战绩已从备份恢复\n详情见历史战绩" : L"原战绩读取异常，已保留\n详情见历史战绩";
+      connectionNoticeUntil_ = Clock::now() + std::chrono::seconds(8);
+    }
     const bool updatesEnabled =
         atoi(Option("update-enabled", "0").c_str()) != 0;
     const std::string updateManifest = Option("update-manifest", "");
@@ -432,9 +424,11 @@ class PetClient {
   }
 
   void Shutdown() {
+    updateManager_.CancelPending();
     RecordAbandonedMatch();
     EndUsageSegment();
     LogEvent("app_exited", telemetryActiveMillis_);
+    eventWriter_.Stop();
     if (socket_ != INVALID_SOCKET) {
       if (pairingAttempted_ || pairingCancelPending_) {
         for (int i = 0; i < 3; ++i) SendPairCancel();
@@ -776,7 +770,7 @@ class PetClient {
     RECT summary{20, 58, width - 20, 137};
     RoundPanel(dc, summary, 14, kCard, kCardEdge, 2);
     wchar_t totals[96]{};
-    swprintf(totals, std::size(totals), L"总计 %u 局    胜 %u    负 %u    平 %u",
+    swprintf(totals, std::size(totals), historyWriteBlocked_ ? L"临时 %u 局    胜 %u    负 %u    平 %u" : L"总计 %u 局    胜 %u    负 %u    平 %u",
              historyTotal_, historyWins_, historyLosses_, historyDraws_);
     RECT totalRect{36, 63, width - 36, 101};
     Text(dc, totals, totalRect, 22, kWhite, FW_BOLD,
@@ -794,7 +788,7 @@ class PetClient {
          kMuted, FW_BOLD, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     if (recentHistory_.empty()) {
       RECT empty{24, 190, width - 24, 270};
-      Text(dc, L"还没有完成过对局", empty, 22, kMuted, FW_NORMAL);
+      Text(dc, historyWriteBlocked_ ? HistoryStorageStatus().c_str() : L"还没有完成过对局", empty, 22, kMuted, FW_NORMAL);
       return;
     }
 
@@ -826,9 +820,11 @@ class PetClient {
       Text(dc, time, timeRect, 17, kMuted, FW_NORMAL,
            DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
-    if (!historyPersistenceOk_) {
+    if (!historyPersistenceOk_ || historyRecovered_) {
       RECT warning{24, rect.bottom - 34, width - 24, rect.bottom - 7};
-      Text(dc, L"战绩暂未写入磁盘，请检查存档目录权限", warning, 17,
+      const wchar_t *message = historyWriteBlocked_ ? L"原档已保留，暂停保存；详见诊断信息" : historyRecovered_ ?
+          L"已恢复备份并保留损坏原档，最近一局可能未恢复" : L"战绩暂未写入磁盘，请检查存档目录权限";
+      Text(dc, message, warning, 17,
            kYellow, FW_NORMAL, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     }
   }
@@ -925,7 +921,9 @@ class PetClient {
             plane_pet_network::Describe(status)) + L"\n错误码：" + std::to_wstring(status.error);
     result += L"\n绑定：" + std::wstring(bindingId_ ? L"已绑定" : L"尚未绑定");
     result += L"\n身份存档：" + std::wstring(statePersistenceOk_ ? L"正常" : L"写入失败");
-    result += L"\n战绩保存：" + std::wstring(historyPersistenceOk_ ? L"正常" : L"写入失败");
+    result += L"\n战绩保存：" + HistoryStorageStatus();
+    result += L"\n本地统计写盘失败：" + std::to_wstring(eventWriter_.Errors()) +
+        L"；未保存事件：" + std::to_wstring(eventWriter_.Dropped());
     result += L"\n匿名使用统计：" + std::wstring(telemetryEnabled_ ? L"已启用" : L"已关闭");
     result += L"\n隐藏快捷键：" + std::wstring(gBossHotkeyAvailable ? L"可用" : L"被其他程序占用，请用右键隐藏");
     result += L"\n\n已连接隧道不代表好友在线；好友状态仍以桌宠圆点为准。"
@@ -1064,8 +1062,7 @@ class PetClient {
           std::abs(y - toolbarPressPoint_.y) <= plane_pet_ui::kToolbarClickSlop &&
           ToolbarTargetAt(x, y) == pressed) {
         if (pressed == 1) InviteFromMenu();
-        else if (pressed == 2) toolbar_.Toggle(GetTickCount64());
-        else SendQuickEmote(pressed - 3);
+        else SendQuickEmote(pressed - 2);
       }
       InvalidateRect(window_, nullptr, FALSE);
       return;
@@ -1088,15 +1085,16 @@ class PetClient {
 
   UINT UiDpi() const { return dpi_; }
 #ifdef PLANE_PET_RELEASE_SELF_TEST
-  void SetToolbarTestState(bool visible, bool expanded, uint64_t slideElapsed = 180) {
+  void SetAnimationElapsedForTest(uint32_t elapsed) {
+    start_ = Clock::now() - std::chrono::milliseconds(elapsed);
+  }
+  void SetToolbarTestState(bool visible) {
     ResetPetToolbar();
     toolbar_.Reset();
     if (!visible) return;
     const auto now = GetTickCount64();
     toolbar_.Observe(true, true, false, now);
-    if (expanded) toolbar_.Toggle(now - std::min(now, slideElapsed));
   }
-  bool ToolbarExpandedForTest() const { return toolbar_.expanded; }
   int ToolbarPressedForTest() const { return toolbarPressed_; }
   uint8_t ToolbarPendingActionForTest() const { return pendingAction_; }
   uint8_t ToolbarOwnEmoteForTest() const { return ownEmote_; }
@@ -1202,6 +1200,7 @@ class PetClient {
   void SeedHistoryRenderCase(bool empty) {
     // Synthetic UI fixtures only: never load/save the user's history here.
     ResetHistory(); historyPersistenceOk_ = true;
+    historyWriteBlocked_ = historyRecovered_ = false;
     if (empty) return;
     historyTotal_ = 15; historyWins_ = 9; historyLosses_ = 3; historyDraws_ = 3;
     constexpr uint8_t own[] = {2, 0, 1, 0, 0, 2, 3, 3, 2, 3};
@@ -1211,6 +1210,11 @@ class PetClient {
       recentHistory_.push_back({1788694380000ULL - i * 61000ULL, own[i], peer[i], outcome[i]});
   }
   static std::wstring HistoryTimeForTest(uint64_t time) { return FormatHistoryTime(time); }
+  void SeedHistoryWarningForTest(bool recovered, bool empty) {
+    SeedHistoryRenderCase(empty);
+    historyWriteBlocked_ = !recovered;
+    historyRecovered_ = historyPersistenceOk_ = recovered;
+  }
   bool HistoryHeartResourceForTest() const {
     using namespace plane_pet_hearts;
     auto *bitmap = HeartAtlasBitmap();
@@ -1297,7 +1301,7 @@ class PetClient {
         hitsPlane(PetFormationAt(elapsedMs).red)) return true;
     const auto hitsBubble = [&](const PetAnimationPose &candidate, bool own) {
       const RECT bubble = QuickEmoteBubbleRect(static_cast<int>(std::lround(candidate.x)),
-          static_cast<int>(std::lround(candidate.y)), own);
+          static_cast<int>(std::lround(candidate.y)), EmoteOnLeft(own));
       return PtInRect(&bubble, point) != FALSE;
     };
     if (ownEmote_ && Clock::now() < ownEmoteUntil_ && hitsBubble(pose, true)) return true;
@@ -1530,9 +1534,7 @@ class PetClient {
   bool IsPetToolbarSurface(int x, int y) const {
     if (!IsPetToolbarVisible()) return false;
     const POINT point{x, y};
-    if (PtInRect(&plane_pet_ui::kToolbarToggle, point)) return true;
-    if (!toolbar_.expanded || !toolbar_.Settled(GetTickCount64()))
-      return PtInRect(&plane_pet_ui::kToolbarPlay, point) != FALSE;
+    if (PtInRect(&plane_pet_ui::kToolbarPlay, point)) return true;
     for (int index = 0; index < 4; ++index) {
       const RECT button = QuickEmoteRect(index);
       if (PtInRect(&button, point)) return true;
@@ -1540,7 +1542,7 @@ class PetClient {
     return false;
   }
   bool IsQuickEmoteBarVisible() const {
-    return IsPetToolbarVisible() && toolbar_.expanded && toolbar_.Settled(GetTickCount64());
+    return IsPetToolbarVisible();
   }
   void ResetPetToolbar() {
     toolbar_.Hide();
@@ -1570,12 +1572,10 @@ class PetClient {
   int ToolbarTargetAt(int x, int y) const {
     if (!IsPetToolbarVisible()) return 0;
     const POINT point{x, y};
-    if (PtInRect(&plane_pet_ui::kToolbarToggle, point)) return 2;
-    if (!toolbar_.Settled(GetTickCount64())) return 0;
-    if (!toolbar_.expanded) return PtInRect(&plane_pet_ui::kToolbarPlay, point) ? 1 : 0;
+    if (PtInRect(&plane_pet_ui::kToolbarPlay, point)) return 1;
     for (int index = 0; index < 4; ++index) {
       const RECT button = QuickEmoteRect(index);
-      if (PtInRect(&button, point)) return index + 3;
+      if (PtInRect(&button, point)) return index + 2;
     }
     return 0;
   }
@@ -1693,7 +1693,7 @@ class PetClient {
       const bool emote = own ? (ownEmote_ && Clock::now() < ownEmoteUntil_)
                              : (peerEmote_ && Clock::now() < peerEmoteUntil_);
       if (emote) {
-        const RECT bubble = QuickEmoteBubbleRect(x, y, own);
+        const RECT bubble = QuickEmoteBubbleRect(x, y, EmoteOnLeft(own));
         badge.center = {bubble.right + (moon ? 2 : -3), bubble.bottom - (moon ? 9 : 11)};
       }
       badge.center.x = std::clamp<LONG>(badge.center.x, moon ? 9 : 5, kPetWidth - (moon ? 12 : 5));
@@ -1739,33 +1739,17 @@ class PetClient {
   }
 
   bool ClearLocalDataFiles() {
-    const auto recent = recentHistory_;
-    const auto total = historyTotal_, wins = historyWins_, losses = historyLosses_, draws = historyDraws_;
-    const auto lastRound = lastRecordedRoundId_;
-    ResetHistory();
-    historyPersistenceOk_ = SaveHistory();
-    if (!historyPersistenceOk_) {
-      recentHistory_ = recent;
-      historyTotal_ = total; historyWins_ = wins; historyLosses_ = losses; historyDraws_ = draws;
-      lastRecordedRoundId_ = lastRound;
-    }
-    bool removed = true;
-    if (!eventsPath_.empty()) {
-      for (const auto &path : {eventsPath_, std::filesystem::path(eventsPath_.wstring() + L".legacy")}) {
-        std::error_code error;
-        std::filesystem::remove(path, error);
-        removed = removed && !error;
-      }
-    }
-    return historyPersistenceOk_ && removed;
+    bool primaryCleared = false;
+    const bool historyCleared = plane_pet_history::Clear(historyPath_, primaryCleared);
+    if (primaryCleared) {
+      ResetHistory();
+      historyWriteBlocked_ = historyRecovered_ = false;
+      historyPersistenceOk_ = true;
+    } else historyPersistenceOk_ = false;
+    const bool eventsCleared = eventWriter_.Clear(eventsPath_);
+    return historyCleared && eventsCleared;
   }
   void ExportLocalData() {
-    if (eventsPath_.empty() || !std::filesystem::exists(eventsPath_)) {
-      PetMessageBoxW(window_,
-                  L"当前没有可导出的匿名实验事件。\n如需参与统计，可在右键“设置与隐私 → 匿名使用统计”中开启。",
-                  L"导出统计记录", MB_OK | MB_ICONINFORMATION);
-      return;
-    }
     wchar_t target[MAX_PATH] = L"PlanePet-events.csv";
     constexpr wchar_t filter[] =
         L"CSV 文件 (*.csv)\0*.csv\0所有文件 (*.*)\0*.*\0\0";
@@ -1779,8 +1763,8 @@ class PetClient {
     dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST |
                    OFN_NOCHANGEDIR;
     if (!PetGetSaveFileNameW(&dialog)) return;
-    if (CopyFileW(eventsPath_.c_str(), target, FALSE) == FALSE) {
-      PetMessageBoxW(window_, L"导出失败，请检查目标目录权限。",
+    if (!eventWriter_.Export(eventsPath_, target)) {
+      PetMessageBoxW(window_, L"导出失败：可能没有记录、文件被占用、记录格式损坏或目标不可写。原统计不会删除。",
                   L"导出统计记录", MB_OK | MB_ICONERROR);
       return;
     }
@@ -2211,36 +2195,11 @@ class PetClient {
   void LogEvent(const char *event, int64_t value = 0) {
     if (!telemetryEnabled_ || event == nullptr) return;
     if (!eventsPath_.empty()) {
-      std::error_code error;
-      const auto parent = eventsPath_.parent_path();
-      if (!parent.empty()) std::filesystem::create_directories(parent, error);
-      constexpr const char *header =
-          "timestamp_ms,client_id,app_version,invite_id,round_id,event,value";
-      bool writeHeader = !std::filesystem::exists(eventsPath_, error) ||
-                         std::filesystem::file_size(eventsPath_, error) == 0;
-      if (!writeHeader) {
-        std::ifstream existing(eventsPath_);
-        std::string existingHeader;
-        std::getline(existing, existingHeader);
-        if (existingHeader != header) {
-          existing.close();
-          const std::filesystem::path legacy =
-              eventsPath_.wstring() + L".legacy";
-          std::filesystem::remove(legacy, error);
-          error.clear();
-          std::filesystem::rename(eventsPath_, legacy, error);
-          if (!error) writeHeader = true;
-        }
-      }
-      if (!error) {
-        std::ofstream output(eventsPath_, std::ios::app);
-        if (output) {
-          if (writeHeader) output << header << '\n';
-          output << UnixTimeMillis() << ',' << clientId_ << ',' << kAppVersion
-                 << ',' << currentInviteId_ << ',' << currentRoundId_ << ','
-                 << event << ',' << value << '\n';
-        }
-      }
+      std::ostringstream row;
+      row << "2," << unsigned(plane_pet_version::kReleaseEpoch) << ',' << UnixTimeMillis()
+          << ',' << clientId_ << ',' << kAppVersion << ',' << currentInviteId_
+          << ',' << currentRoundId_ << ',' << event << ',' << value;
+      eventWriter_.Enqueue(eventsPath_, row.str());
     }
     SendTelemetryEvent(event, value);
   }
@@ -2400,77 +2359,26 @@ class PetClient {
   }
 
   void LoadHistory() {
-    std::ifstream input(historyPath_);
-    if (!input) return;
-    std::string magic;
-    uint32_t version = 0;
-    uint32_t total = 0;
-    uint32_t wins = 0;
-    uint32_t losses = 0;
-    uint32_t draws = 0;
-    if (!(input >> magic >> version >> total >> wins >> losses >> draws) ||
-        magic != "PLANE_PET_HISTORY" || (version != 1 && version != 2) ||
-        static_cast<uint64_t>(wins) + losses + draws != total) {
-      ResetHistory();
-      return;
-    }
-    uint64_t lastRecordedRoundId = 0;
-    if (version == 2 && !(input >> lastRecordedRoundId)) {
-      ResetHistory();
-      return;
-    }
-    std::vector<HistoryEntry> entries;
-    uint64_t timestamp = 0;
-    uint32_t ownHealth = 0;
-    uint32_t peerHealth = 0;
-    int outcome = 0;
-    while (input >> timestamp >> ownHealth >> peerHealth >> outcome) {
-      if (ownHealth > plink::kInitialHealth ||
-          peerHealth > plink::kInitialHealth || outcome < -1 || outcome > 1) {
-        ResetHistory();
-        return;
-      }
-      if (entries.size() < 10) {
-        entries.push_back({timestamp, static_cast<uint8_t>(ownHealth),
-                           static_cast<uint8_t>(peerHealth),
-                           static_cast<int8_t>(outcome)});
-      }
-    }
-    if (!input.eof()) {
-      ResetHistory();
-      return;
-    }
-    historyTotal_ = total;
-    historyWins_ = wins;
-    historyLosses_ = losses;
-    historyDraws_ = draws;
-    lastRecordedRoundId_ = lastRecordedRoundId;
-    recentHistory_ = std::move(entries);
+    plane_pet_history::Data data;
+    historyPersistenceOk_ = plane_pet_history::Load(historyPath_, data, historyWriteBlocked_, historyRecovered_);
+    historyTotal_ = data.total; historyWins_ = data.wins;
+    historyLosses_ = data.losses; historyDraws_ = data.draws;
+    lastRecordedRoundId_ = data.lastRound; recentHistory_ = std::move(data.entries);
   }
 
-  bool SaveHistory() const {
-    std::error_code error;
-    const auto parent = historyPath_.parent_path();
-    if (!parent.empty()) std::filesystem::create_directories(parent, error);
-    const std::filesystem::path temporary =
-        historyPath_.wstring() + L".tmp";
-    std::ofstream output(temporary, std::ios::trunc);
-    if (!output) return false;
-    output << "PLANE_PET_HISTORY 2 " << historyTotal_ << ' '
-           << historyWins_ << ' ' << historyLosses_ << ' '
-           << historyDraws_ << ' ' << lastRecordedRoundId_ << '\n';
-    for (const HistoryEntry &entry : recentHistory_) {
-      output << entry.timestampMs << ' '
-             << static_cast<uint32_t>(entry.ownHealth) << ' '
-             << static_cast<uint32_t>(entry.peerHealth) << ' '
-             << static_cast<int>(entry.outcome) << '\n';
-    }
-    output.close();
-    if (!output) return false;
-    return MoveFileExW(temporary.c_str(), historyPath_.c_str(),
-                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) !=
-           FALSE;
+  std::wstring HistoryStorageStatus() const {
+    if (historyWriteBlocked_) return L"原战绩无法读取，已保留并停止覆盖；本次新增仅保存在内存";
+    if (!historyPersistenceOk_) return L"战绩暂未写入磁盘，请检查存档目录权限";
+    if (historyRecovered_) return L"已恢复有效备份，损坏原档已另存；最近一局可能未恢复";
+    return L"正常";
   }
+
+  bool SaveHistory() {
+    return plane_pet_history::Save(historyPath_,
+        {historyTotal_, historyWins_, historyLosses_, historyDraws_, lastRecordedRoundId_, recentHistory_},
+        historyWriteBlocked_);
+  }
+
 
   void RecordMatchHistory() {
     if (historyRecordedForRound_ || currentRoundId_ == 0 ||
@@ -2883,7 +2791,6 @@ class PetClient {
     const plink::PlayerAction action = QuickEmoteAction(index);
     SendAction(action);
     lastEmoteSentAt_ = now;
-    toolbar_.EmoteSent(GetTickCount64());
     ownEmote_ = plink::QuickEmoteValue(action);
     ownEmoteStartedAt_ = now;
     ownEmoteUntil_ = now +
@@ -4364,6 +4271,8 @@ class PetClient {
         Gdiplus::UnitPixel, &attributes) == Gdiplus::Ok;
   }
 
+  bool EmoteOnLeft(bool own) const { return own; }
+
   static RECT QuickEmoteBubbleRect(int planeX, int planeY, bool toLeft) {
     const int left = std::clamp(planeX + (toLeft ? -54 : 12), 2, 230);
     const int top = std::clamp(planeY - 49, 2, 70);
@@ -4699,10 +4608,10 @@ class PetClient {
     const auto now = Clock::now();
     const bool ownEmoteVisible = ownEmote_ != 0 && now < ownEmoteUntil_;
     if (ownEmoteVisible)
-      DrawQuickEmoteBubble(dc, planeX, planeY, ownEmote_, true,
+      DrawQuickEmoteBubble(dc, planeX, planeY, ownEmote_, EmoteOnLeft(true),
                            MillisSince(ownEmoteStartedAt_));
     if (peerOnline && peerEmote_ != 0 && now < peerEmoteUntil_)
-      DrawQuickEmoteBubble(dc, peerX, peerY, peerEmote_, false,
+      DrawQuickEmoteBubble(dc, peerX, peerY, peerEmote_, EmoteOnLeft(false),
                            MillisSince(peerEmoteStartedAt_));
 
     for (const auto &badge : StatusBadges()) plane_pet_ui::DrawStatusBadge(dc, badge);
@@ -4882,10 +4791,9 @@ class PetClient {
     RestoreDC(dc,savedHud);
   }
 
-  void DrawToolbarEmotes(HDC dc, bool enabled, int offset = 0) const {
+  void DrawToolbarEmotes(HDC dc, bool enabled) const {
     for (int index = 0; index < 4; ++index) {
       RECT button = QuickEmoteRect(index);
-      OffsetRect(&button, offset, 0);
       RoundPanel(dc, button, 15,
                  enabled ? RGB(28, 37, 53) : RGB(25, 29, 38),
                  enabled ? RGB(91, 146, 190) : RGB(60, 66, 78), 1);
@@ -4901,8 +4809,7 @@ class PetClient {
     if (!IsPetToolbarVisible()) return;
     using namespace plane_pet_ui;
     const bool enabled = CanInvite();
-    const double reveal = toolbar_.Reveal(GetTickCount64());
-    if (reveal < 1.0) {
+    {
       RoundPanel(dc, kToolbarPlay, 15,
                  toolbarPressed_ == 1 ? RGB(28, 57, 77) : RGB(19, 27, 41),
                  enabled ? RGB(56, 156, 222) : RGB(60, 66, 78), 1);
@@ -4928,33 +4835,7 @@ class PetClient {
           enabled ? kWhite : RGB(110, 116, 128), FW_BOLD,
           DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
-    if (reveal >= 1.0) {
-      // Final expanded pixels match the original four buttons, including gaps.
-      DrawToolbarEmotes(dc, CanSendQuickEmote());
-    } else if (reveal > 0.0) {
-      const int width = kToolbarPlay.right - kToolbarPlay.left;
-      const int offset = width - static_cast<int>(std::lround(width * reveal));
-      const int saved = SaveDC(dc);
-      if (saved) {
-        IntersectClipRect(dc, kToolbarPlay.left + offset, kToolbarPlay.top,
-                         kToolbarPlay.right, kToolbarPlay.bottom);
-        Fill(dc, kToolbarPlay, RGB(19, 27, 41));
-        DrawToolbarEmotes(dc, CanSendQuickEmote(), offset);
-        RestoreDC(dc, saved);
-      }
-    }
-    RoundPanel(dc, kToolbarToggle, 15,
-        toolbarPressed_ == 2 ? RGB(28, 57, 77) : RGB(19, 27, 41), RGB(56, 156, 222), 1);
-    const int cx = (kToolbarToggle.left + kToolbarToggle.right) / 2;
-    const int cy = (kToolbarToggle.top + kToolbarToggle.bottom) / 2;
-    const int direction = toolbar_.expanded ? 1 : -1;
-    POINT triangle[3]{{cx + direction * 4, cy},
-                      {cx - direction * 3, cy - 5}, {cx - direction * 3, cy + 5}};
-    HBRUSH brush = CreateSolidBrush(kBlueLight);
-    const auto oldBrush = SelectObject(dc, brush);
-    const auto oldPen = SelectObject(dc, GetStockObject(NULL_PEN));
-    Polygon(dc, triangle, 3);
-    SelectObject(dc, oldPen); SelectObject(dc, oldBrush); DeleteObject(brush);
+    DrawToolbarEmotes(dc, CanSendQuickEmote());
   }
 
   void DrawPet(HDC dc, int width, int height) const {
@@ -5259,6 +5140,7 @@ class PetClient {
   pcpair::AuthKey networkKey_{};
   std::filesystem::path statePath_;
   std::filesystem::path eventsPath_;
+  plane_pet_events::Writer eventWriter_;
   std::filesystem::path historyPath_;
   std::filesystem::path settingsPath_;
   std::filesystem::path updateRequestPath_;
@@ -5387,6 +5269,8 @@ class PetClient {
   bool dndUsageOpen_ = false;
   bool historyRecordedForRound_ = false;
   bool historyPersistenceOk_ = true;
+  bool historyWriteBlocked_ = false;
+  bool historyRecovered_ = false;
   bool statePersistenceOk_ = true;
   bool stateRecoveredFromBackup_ = false;
   bool abandonedMatch_ = false;

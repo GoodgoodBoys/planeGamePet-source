@@ -68,6 +68,7 @@ class Manager {
   void CheckNow(bool requiredByPeer = false);
   bool AcceptAndDownload();
   void Dismiss();
+  void CancelPending() { cancel_.store(true); }
   void SetOptionalSnoozeUntil(uint64_t unixTimeMs);
   Snapshot GetSnapshot() const;
   bool Enabled() const;

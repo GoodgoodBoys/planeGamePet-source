@@ -51,7 +51,7 @@ void RunIdleWindowCases(HWND window, const std::filesystem::path &directory, Che
   check("idle_auto_long_pause_no_catchup_burst", catchup);
   const auto seed = [&]() {
     gClient.SeedDndRenderCase(false, false, true, false, false);
-    gClient.ClearDndNotice(); gClient.SetToolbarTestState(true, false);
+    gClient.ClearDndNotice(); gClient.SetToolbarTestState(true);
   };
   const auto down = [&](int x, int y) { SendMessageW(window, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(x, y)); };
   const auto up = [&](int x, int y) { SendMessageW(window, WM_LBUTTONUP, 0, MAKELPARAM(x, y)); };
@@ -73,17 +73,16 @@ void RunIdleWindowCases(HWND window, const std::filesystem::path &directory, Che
   check("idle_drag_does_not_change_fire_sequence", same(beforeClick, gClient.IdleAutoFrameForTest(1000)));
   down(15, 130); ReleaseCapture(); up(15, 130);
   check("idle_capture_loss_does_not_change_fire_sequence", same(beforeClick, gClient.IdleAutoFrameForTest(1000)));
-  seed(); gClient.SetToolbarTestState(true, true, kToolbarRememberMs - 20);
-  gClient.AllowEmoteForTest(); down(80, 130); up(80, 130);
+  seed(); gClient.SetToolbarTestState(true);
+  gClient.AllowEmoteForTest(); down(125, 130); up(125, 130);
   gClient.ObserveToolbarForTest(GetTickCount64() + 100);
-  check("toolbar_actual_emote_send_refreshes_memory", gClient.ToolbarExpandedForTest());
-  gClient.SetToolbarTestState(true, true, kToolbarRememberMs - 20);
-  down(80, 130); up(80, 130); gClient.ObserveToolbarForTest(GetTickCount64() + 100);
-  check("toolbar_cooldown_click_does_not_refresh_memory", !gClient.ToolbarExpandedForTest());
+  check("toolbar_emote_send_keeps_all_actions", gClient.IsQuickEmoteBarVisible() && gClient.ToolbarOwnEmoteForTest() == 1);
+  down(163, 130); up(163, 130);
+  check("toolbar_cooldown_does_not_send_second_emote", gClient.ToolbarOwnEmoteForTest() == 1);
   seed(); gClient.SeedDndRenderCase(false, false, false, false, false);
-  gClient.SetToolbarTestState(true, true, kToolbarRememberMs - 20);
-  down(80, 130); up(80, 130); gClient.ObserveToolbarForTest(GetTickCount64() + 100);
-  check("toolbar_offline_click_does_not_refresh_memory", !gClient.ToolbarExpandedForTest());
+  gClient.SetToolbarTestState(true);
+  down(125, 130); up(125, 130);
+  check("toolbar_offline_emotes_visible_but_not_sent", gClient.IsQuickEmoteBarVisible() && !gClient.ToolbarOwnEmoteForTest());
   check("idle_offline_has_automatic_shots", !gClient.IdleAutoFrameForTest(900).empty());
   seed(); gClient.SeedHiddenPairingForTest();
   check("idle_unbound_has_automatic_shots", !gClient.IdleAutoFrameForTest(900).empty());
@@ -101,6 +100,15 @@ void RunIdleWindowCases(HWND window, const std::filesystem::path &directory, Che
     check(("idle_auto_shoot_image_" + std::to_string(dpi)).c_str(), SaveReleaseFixture(
         directory / (L"idle-auto-shot-" + std::to_wstring(dpi) + L".png"), 280, 150,
         [&](HDC dc) { gClient.Draw(dc, rect); }));
+  }
+  gClient.SeedDpiRenderCase(false);
+  for (uint32_t elapsed = 0; elapsed < 15000; elapsed += 1250) {
+    gClient.SeedDndRenderCase(true, false, true, true, false);
+    gClient.SetAnimationElapsedForTest(elapsed);
+    gClient.SetToolbarTestState(true);
+    check(("idle_chase_keyframe_" + std::to_string(elapsed)).c_str(), SaveReleaseFixture(
+        directory / (L"chase-" + std::to_wstring(elapsed) + L".png"), 280, 150,
+        [&](HDC dc) { gClient.Draw(dc, RECT{0, 0, 280, 150}); }));
   }
   gClient.SeedDpiRenderCase(false);
 }

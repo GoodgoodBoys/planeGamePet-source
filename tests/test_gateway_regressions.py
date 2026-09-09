@@ -39,6 +39,8 @@ class GatewayAsyncTest(unittest.IsolatedAsyncioTestCase):
         self.path = Path(self.temp.name) / "telemetry.db"
         g.TOKENS = {}
         g.active_connections = 0
+        g.established_connections = 0
+        g.online_alert_recorder = None
         g.active_installations.clear()
         g.active_lock = asyncio.Lock()
         g.last_telemetry_prune = 0
@@ -133,6 +135,38 @@ class GatewayAsyncTest(unittest.IsolatedAsyncioTestCase):
         with patch.object(g, "persist_tokens") as persist:
             self.assertIn(b"503", await self.request())
             persist.assert_not_called()
+
+    async def test_zero_aggregate_cap_allows_more_than_500(self):
+        g.active_connections = 500
+        with patch.object(g, "MAX_CONNECTIONS", 0), patch.object(g, "persist_tokens"):
+            self.assertIn(b"101", await self.request())
+        self.assertEqual(g.active_connections, 500)
+
+    async def test_explicit_positive_cap_remains_available_for_emergency(self):
+        g.active_connections = 500
+        with patch.object(g, "MAX_CONNECTIONS", 500), patch.object(g, "persist_tokens") as persist:
+            self.assertIn(b"503", await self.request())
+            persist.assert_not_called()
+
+    async def test_milestone_hook_observes_successful_handshakes_only(self):
+        from unittest.mock import Mock
+        recorder = Mock()
+        g.established_connections = 99
+        with patch.object(g, "online_alert_recorder", recorder), patch.object(g, "persist_tokens"):
+            self.assertIn(b"400", await self.request(valid=False))
+            recorder.observe.assert_not_called()
+            self.assertIn(b"101", await self.request())
+            recorder.observe.assert_called_once_with(100, g.MAX_CONNECTIONS)
+        self.assertEqual(g.established_connections, 99)
+
+    async def test_milestone_hook_failure_does_not_close_game_early(self):
+        from unittest.mock import Mock
+        recorder = Mock()
+        recorder.observe.side_effect = RuntimeError("synthetic recorder fault")
+        with patch.object(g, "online_alert_recorder", recorder), patch.object(g, "persist_tokens"):
+            self.assertIn(b"101", await self.request())
+        self.assertEqual(g.active_connections, 0)
+        self.assertEqual(g.established_connections, 0)
 
     async def test_locked_sqlite_does_not_block_event_loop(self):
         self.service = g.TelemetryService(self.path)

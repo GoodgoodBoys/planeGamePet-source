@@ -106,6 +106,14 @@ void RunHistoryWindowCases(HWND window, const std::filesystem::path &directory, 
       gClient.DrawHistoryWindow(dc, RECT{0, 0, kHistoryWidth, kHistoryContentHeight});
     }));
   }
+  for (int state = 0; state < 3; ++state) {
+    gClient.SeedHistoryWarningForTest(state == 2, state == 0);
+    check(("history_storage_warning_image_" + std::to_string(state)).c_str(), SaveReleaseFixture(
+        directory / (L"history-storage-" + std::to_wstring(state) + L".png"),
+        kHistoryWidth, kHistoryContentHeight, [&](HDC dc) {
+      gClient.DrawHistoryWindow(dc, RECT{0, 0, kHistoryWidth, kHistoryContentHeight});
+    }));
+  }
   gClient.SeedHistoryRenderCase(false);
   bool handlesStable = false;
   check("history_repeat_render_fixture", SaveReleaseFixture(directory / L"history-repeat.png",

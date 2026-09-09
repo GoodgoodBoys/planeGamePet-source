@@ -12,6 +12,11 @@ $common = @("-std=c++17", "-O2", "-Wall", "-Wextra",
     "-B$(Split-Path -Parent $Compiler)\", "-static", "-static-libgcc",
     "-static-libstdc++", "-DPLANE_PET_UPDATE_SELF_TEST")
 $stateExe = Join-Path $dist "PlanePetUpdateStateTest.exe"
+$networkExe = Join-Path $dist "PlanePetUpdateNetworkTest.exe"
+& $Compiler @common (Join-Path $root 'tests\update_network_test.cpp') -o $networkExe -lws2_32 -lwinhttp -lcrypt32 -lbcrypt
+if ($LASTEXITCODE -ne 0) { throw 'Update network regression build failed.' }
+& $networkExe
+if ($LASTEXITCODE -ne 0) { throw 'Update network regressions failed. Run in the normal Windows environment (TLS is unavailable in the restricted sandbox).' }
 & $Compiler @common (Join-Path $root "tests\update_state_test.cpp") `
     (Join-Path $root "desktop\update_manager.cpp") -o $stateExe `
     -lwinhttp -lcrypt32 -lbcrypt

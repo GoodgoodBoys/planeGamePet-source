@@ -88,7 +88,6 @@ int main(int argc, char **argv) {
   if (!client.IsInteractivePetPoint(22, 104) || client.IsInteractivePetPoint(194, 145)) return 34;
   client.snapshot_.phase = plink::GamePhase::Menu;
   client.toolbar_.Observe(true, true, false, GetTickCount64());
-  client.toolbar_.Toggle(GetTickCount64() - plane_pet_ui::kToolbarSlideMs);
   if (!client.IsQuickEmoteBarVisible()) return 35;
   client.snapshot_.phase = plink::GamePhase::Waiting;
   client.snapshot_.inviterSlot = 1;

@@ -15,6 +15,16 @@ std::vector<uint8_t> Read(const std::filesystem::path &path) {
 int main(int argc, char **argv) {
   using namespace plane_pet_update;
   try {
+    if (argc == 3 && std::string(argv[1]) == "transport") {
+      // Read-only production HTTPS + RSA probe; never accepts a manifest for installation.
+      std::vector<uint8_t> manifest, signatureText, signature;
+      if (!HttpGet(argv[2], 65536, manifest) ||
+          !HttpGet(std::string(argv[2]) + ".sig", 4096, signatureText) ||
+          !DecodeBase64(std::string(signatureText.begin(), signatureText.end()), signature) ||
+          !VerifyManifestSignature(manifest, signature)) return 11;
+      std::printf("UPDATE_PRODUCTION_HTTPS_RSA_OK bytes=%zu redirects_disabled=1 installation=0\n", manifest.size());
+      return 0;
+    }
     if (argc >= 5 && std::string(argv[1]) == "offline") {
       auto manifestBytes = Read(argv[2]);
       const auto signatureText = Read(std::string(argv[2]) + ".sig");

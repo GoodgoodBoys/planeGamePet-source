@@ -20,6 +20,10 @@ try {
     Check-Exit "client edge compile"
     & .\dist\PlanePetClientEdgeTest.exe $testRoot
     Check-Exit "client edges"
+    & $Compiler "-B$(Split-Path -Parent $Compiler)\" -std=c++17 -O2 -Wall -Wextra -static -static-libgcc -static-libstdc++ tests/storage_regression_test.cpp desktop/update_manager.cpp -o dist/PlanePetStorageTest.exe -lws2_32 -lgdi32 -lgdiplus -lole32 -lshell32 -lcomdlg32 -lwinhttp -lcrypt32 -lbcrypt
+    Check-Exit "storage compile"
+    & .\dist\PlanePetStorageTest.exe (Join-Path $testRoot 'storage')
+    Check-Exit "storage regressions"
     & $Compiler "-B$(Split-Path -Parent $Compiler)\" -std=c++17 -O2 -Wall -Wextra -static -static-libgcc -static-libstdc++ tests/server_state_test.cpp -o dist/PlanePetServerStateTest.exe -lws2_32 -lbcrypt
     Check-Exit "server state compile"
     & .\dist\PlanePetServerStateTest.exe $testRoot

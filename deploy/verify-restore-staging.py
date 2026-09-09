@@ -46,7 +46,7 @@ def main():
     result = {}
     with tempfile.TemporaryDirectory(prefix='restore-check-', dir=root) as folder:
         restored = Path(folder)
-        for name in backup.FILES:
+        for name in json.loads((source / 'manifest.json').read_text()):
             shutil.copyfile(source / name, restored / name)
         udp_port, http_port = port(socket.SOCK_DGRAM), port(socket.SOCK_STREAM)
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
@@ -54,6 +54,7 @@ def main():
             PLANE_PET_UDP_HOST='127.0.0.1', PLANE_PET_UDP_PORT=str(udp_port),
             PLANE_PET_TOKEN_STORE=str(restored / 'gateway_tokens.db'),
             PLANE_PET_TELEMETRY_STORE=str(restored / 'telemetry.db'),
+            PLANE_PET_ONLINE_ALERTS_ENABLED='0',
             PLANE_PET_ADMIN_PASSWORD=secrets.token_hex(24))
         processes = []
         try:

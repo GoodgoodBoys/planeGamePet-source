@@ -1,4 +1,5 @@
 """Bounded local WebSocket/UDP transport capacity test, no ECS or real IDs."""
+import argparse
 import asyncio
 import importlib.util
 import json
@@ -12,16 +13,16 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-async def run(folder):
+async def run(folder, count, unlimited=False):
     os.environ['PLANE_PET_TOKEN_STORE'] = str(folder / 'tokens.db')
     os.environ['PLANE_PET_TELEMETRY_STORE'] = str(folder / 'telemetry.db')
     os.environ['PLANE_PET_ADMIN_PASSWORD_FILE'] = str(folder / 'no-password')
-    os.environ['PLANE_PET_MAX_CONNECTIONS'] = '128'
+    os.environ['PLANE_PET_MAX_CONNECTIONS'] = '0' if unlimited else str(count)
     spec = importlib.util.spec_from_file_location('capacity_gateway', ROOT / 'gateway/plane_pet_gateway.py')
     g = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(g)
     logging.getLogger().setLevel(logging.WARNING)
-    g.TOKENS = {g.token_digest(f'Bearer {index:064x}'): ('1', 'synthetic') for index in range(1, 130)}
+    g.TOKENS = {g.token_digest(f'Bearer {index:064x}'): ('1', 'synthetic') for index in range(1, count + 2)}
     original_tokens = dict(g.TOKENS)
 
     class Echo(asyncio.DatagramProtocol):
@@ -30,7 +31,7 @@ async def run(folder):
 
     udp, _ = await asyncio.get_running_loop().create_datagram_endpoint(Echo, local_addr=('127.0.0.1', 0))
     g.UDP_HOST, g.UDP_PORT = udp.get_extra_info('sockname')[:2]
-    server = await asyncio.start_server(g.handle_client, '127.0.0.1', 0, backlog=256)
+    server = await asyncio.start_server(g.handle_client, '127.0.0.1', 0, backlog=1024)
     port = server.sockets[0].getsockname()[1]
     connections = []
     all_writers = []
@@ -72,18 +73,24 @@ async def run(folder):
 
     start, cpu = time.perf_counter(), time.process_time()
     try:
-        connections.extend(await asyncio.gather(*(open_client(index) for index in range(1, 129))))
-        assert g.active_connections == 128
-        await open_client(129, False)
+        connections.extend(await asyncio.gather(*(open_client(index) for index in range(1, count + 1))))
+        assert g.active_connections == count
+        extra = await open_client(count + 1, unlimited)
+        if unlimited:
+            await wait_count(count + 1)
+            await echo_client(extra, 999)
+            extra[1].close()
+            await extra[1].wait_closed()
+            await wait_count(count)
         for batch in range(20):
             await asyncio.gather(*(echo_client(connection, batch) for connection in connections))
             await asyncio.sleep(.05)
         for wave in range(3):
             for _, writer in connections[:16]: writer.close()
             await asyncio.gather(*(writer.wait_closed() for _, writer in connections[:16]))
-            await wait_count(112)
+            await wait_count(count - 16)
             connections[:16] = await asyncio.gather(*(open_client(index) for index in range(1, 17)))
-            await wait_count(128)
+            await wait_count(count)
             await asyncio.gather(*(echo_client(connection, 100 + wave) for connection in connections))
         assert g.TOKENS == original_tokens and not (folder / 'tokens.db').exists()
     finally:
@@ -96,7 +103,8 @@ async def run(folder):
         udp.close()
     elapsed = time.perf_counter() - start
     samples.sort()
-    result = dict(connections=128, extra_connection_rejected=True, reconnect_waves=3,
+    result = dict(connections=count, connection_limit=g.MAX_CONNECTIONS,
+        extra_connection_rejected=not unlimited, extra_connection_accepted=unlimited, reconnect_waves=3,
         reconnects=48, roundtrips=len(samples), rtt_median_ms=round(statistics.median(samples), 2),
         rtt_p95_ms=round(samples[int(len(samples) * .95)], 2), elapsed_seconds=round(elapsed, 2),
         combined_client_gateway_cpu_seconds=round(time.process_time() - cpu, 2),
@@ -106,5 +114,9 @@ async def run(folder):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--connections', type=int, default=500, choices=range(16, 501), metavar='16..500')
+    parser.add_argument('--unlimited', action='store_true', help='Verify limit=0 admits client 501 as well')
+    args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='plane-pet-capacity-') as folder:
-        asyncio.run(asyncio.wait_for(run(Path(folder)), 45))
+        asyncio.run(asyncio.wait_for(run(Path(folder), args.connections, args.unlimited), 45))
